@@ -1,0 +1,14 @@
+// F4Menu resource script for application icon
+
+// Include default resource defines for MSVC rc.exe compatibility
+#ifdef APSTUDIO_INVOKED
+#ifndef APSTUDIO_READONLY_SYMBOLS
+#define APSTUDIO_READONLY_SYMBOLS
+#endif
+#endif
+
+// Application icon
+// Use resource ID 107 to match the provided icon name hint
+107 ICON "F4Menu_107.ico"
+
+
