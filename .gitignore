@@ -1,0 +1,17 @@
+# Build output
+*.exe
+*.obj
+*.res
+*.pdb
+*.ilk
+*.log
+*.tlog
+*.lastbuildstate
+*.manifest
+*.exp
+*.lib
+obj/
+F4Menu/
+
+# User config
+F4Menu.ini
