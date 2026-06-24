@@ -19,6 +19,7 @@
 #include <commdlg.h>
 #include <shlobj.h>
 #include <shellapi.h>
+#include <winver.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <wchar.h>
@@ -27,6 +28,7 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "version.lib")
 
 // Constants
 #define MAX_PROGRAMS 100
@@ -77,6 +79,12 @@ int g_programCount = 0;
 HWND g_hListView = NULL;
 HIMAGELIST g_hImageList = NULL;
 
+// Pre-fill data for add dialog
+WCHAR g_prefillPath[MAX_PATH_LEN] = {0};
+WCHAR g_prefillName[MAX_NAME_LEN] = {0};
+WCHAR g_prefillStart[MAX_PATH_LEN] = {0};
+int g_editIndex = -1;
+
 // Settings
 typedef struct {
     int winPosX;
@@ -98,7 +106,7 @@ void InitListView(HWND hwnd);
 void PopulateListView();
 void AddProgramToListView(int index);
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
-INT_PTR CALLBACK EditDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+LRESULT CALLBACK EditDialogSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR subclassId, DWORD_PTR refData);
 void ShowEditDialog(HWND parent, int index);
 void DeleteSelectedPrograms(HWND hwnd);
 void ShowAboutDialog(HWND parent);
@@ -107,6 +115,7 @@ BOOL MatchExtension(const WCHAR* fileExt, const WCHAR* typeList);
 void ExecuteProgram(ProgramConfig* prog, WCHAR** files, int fileCount);
 HICON LoadIconFromPath(const WCHAR* iconPath);
 void ExpandEnvStrings(const WCHAR* src, WCHAR* dst, DWORD dstSize);
+BOOL GetExeProductName(const WCHAR* exePath, WCHAR* name, DWORD nameSize);
 
 // Get INI file path (same directory as executable)
 void GetIniFilePath(WCHAR* path, DWORD size) {
@@ -121,6 +130,43 @@ void GetIniFilePath(WCHAR* path, DWORD size) {
 // Expand environment variables
 void ExpandEnvStrings(const WCHAR* src, WCHAR* dst, DWORD dstSize) {
     ExpandEnvironmentStringsW(src, dst, dstSize);
+}
+
+// Extract product name from PE version info
+BOOL GetExeProductName(const WCHAR* exePath, WCHAR* name, DWORD nameSize) {
+    DWORD verHandle = 0;
+    DWORD verSize = GetFileVersionInfoSizeW(exePath, &verHandle);
+    if (verSize == 0) return FALSE;
+    
+    BYTE* verData = (BYTE*)HeapAlloc(GetProcessHeap(), 0, verSize);
+    if (!verData) return FALSE;
+    
+    if (!GetFileVersionInfoW(exePath, 0, verSize, verData)) {
+        HeapFree(GetProcessHeap(), 0, verData);
+        return FALSE;
+    }
+    
+    UINT len = 0;
+    WCHAR* prodName = NULL;
+    // Try Chinese first, then English, then neutral
+    if (VerQueryValueW(verData, L"\\StringFileInfo\\080404b0\\ProductName", (LPVOID*)&prodName, &len) && len > 0) {
+        wcscpy_s(name, nameSize, prodName);
+        HeapFree(GetProcessHeap(), 0, verData);
+        return TRUE;
+    }
+    if (VerQueryValueW(verData, L"\\StringFileInfo\\040904b0\\ProductName", (LPVOID*)&prodName, &len) && len > 0) {
+        wcscpy_s(name, nameSize, prodName);
+        HeapFree(GetProcessHeap(), 0, verData);
+        return TRUE;
+    }
+    if (VerQueryValueW(verData, L"\\StringFileInfo\\000004b0\\ProductName", (LPVOID*)&prodName, &len) && len > 0) {
+        wcscpy_s(name, nameSize, prodName);
+        HeapFree(GetProcessHeap(), 0, verData);
+        return TRUE;
+    }
+    
+    HeapFree(GetProcessHeap(), 0, verData);
+    return FALSE;
 }
 
 // Load settings from INI
@@ -353,43 +399,9 @@ void PopulateListView() {
     }
 }
 
-// Edit dialog procedure
-INT_PTR CALLBACK EditDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    static int* pIndex = NULL;
-    
+// Edit dialog subclass procedure
+LRESULT CALLBACK EditDialogSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR subclassId, DWORD_PTR refData) {
     switch (msg) {
-        case WM_INITDIALOG: {
-            pIndex = (int*)lParam;
-            
-            // Center dialog
-            RECT rc, rcOwner;
-            GetWindowRect(hwnd, &rc);
-            GetWindowRect(GetParent(hwnd), &rcOwner);
-            SetWindowPos(hwnd, NULL,
-                rcOwner.left + (rcOwner.right - rcOwner.left - (rc.right - rc.left)) / 2,
-                rcOwner.top + (rcOwner.bottom - rcOwner.top - (rc.bottom - rc.top)) / 2,
-                0, 0, SWP_NOSIZE | SWP_NOZORDER);
-            
-            // Populate fields if editing existing program
-            if (*pIndex >= 0 && *pIndex < g_programCount) {
-                ProgramConfig* prog = &g_programs[*pIndex];
-                SetDlgItemTextW(hwnd, IDD_EDIT_NAME, prog->name);
-                SetDlgItemTextW(hwnd, IDD_EDIT_PATH, prog->path);
-                SetDlgItemTextW(hwnd, IDD_EDIT_PARAM, prog->param);
-                SetDlgItemTextW(hwnd, IDD_EDIT_START, prog->start);
-                SetDlgItemTextW(hwnd, IDD_EDIT_ICON, prog->icon);
-                SetDlgItemTextW(hwnd, IDD_EDIT_TYPE, prog->type);
-                
-                SendDlgItemMessageW(hwnd, IDD_COMBO_MODE, CB_SETCURSEL, prog->mode, 0);
-                SendDlgItemMessageW(hwnd, IDD_COMBO_WINDOW, CB_SETCURSEL, prog->window, 0);
-            } else {
-                SendDlgItemMessageW(hwnd, IDD_COMBO_MODE, CB_SETCURSEL, 0, 0);
-                SendDlgItemMessageW(hwnd, IDD_COMBO_WINDOW, CB_SETCURSEL, 0, 0);
-            }
-            
-            return TRUE;
-        }
-        
         case WM_COMMAND: {
             switch (LOWORD(wParam)) {
                 case IDD_BTN_BROWSE_PATH: {
@@ -406,7 +418,6 @@ INT_PTR CALLBACK EditDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     if (GetOpenFileNameW(&ofn)) {
                         SetDlgItemTextW(hwnd, IDD_EDIT_PATH, fileName);
                         
-                        // Auto-fill icon if empty
                         WCHAR iconPath[MAX_PATH_LEN];
                         GetDlgItemTextW(hwnd, IDD_EDIT_ICON, iconPath, MAX_PATH_LEN);
                         if (wcslen(iconPath) == 0) {
@@ -414,7 +425,7 @@ INT_PTR CALLBACK EditDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                             SetDlgItemTextW(hwnd, IDD_EDIT_ICON, fileName);
                         }
                     }
-                    return TRUE;
+                    return 0;
                 }
                 
                 case IDD_BTN_BROWSE_ICON: {
@@ -432,7 +443,7 @@ INT_PTR CALLBACK EditDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                         wcscat_s(fileName, MAX_PATH, L",0");
                         SetDlgItemTextW(hwnd, IDD_EDIT_ICON, fileName);
                     }
-                    return TRUE;
+                    return 0;
                 }
                 
                 case IDD_BTN_OK: {
@@ -449,72 +460,75 @@ INT_PTR CALLBACK EditDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     prog.window = (int)SendDlgItemMessageW(hwnd, IDD_COMBO_WINDOW, CB_GETCURSEL, 0, 0);
                     prog.main = 0;
                     
-                    // Validate
                     if (wcslen(prog.name) == 0 || wcslen(prog.path) == 0) {
                         MessageBoxW(hwnd, L"名称和路径不能为空！", L"错误", MB_OK | MB_ICONERROR);
-                        return TRUE;
+                        return 0;
                     }
                     
-                    // Save program
-                    if (*pIndex >= 0 && *pIndex < g_programCount) {
-                        // Edit existing
-                        g_programs[*pIndex] = prog;
+                    if (g_editIndex >= 0 && g_editIndex < g_programCount) {
+                        g_programs[g_editIndex] = prog;
                     } else {
-                        // Add new
                         if (g_programCount < MAX_PROGRAMS) {
                             g_programs[g_programCount++] = prog;
                         } else {
                             MessageBoxW(hwnd, L"已达到最大程序数量限制！", L"错误", MB_OK | MB_ICONERROR);
-                            return TRUE;
+                            return 0;
                         }
                     }
                     
-                    EndDialog(hwnd, IDOK);
-                    return TRUE;
+                    SavePrograms();
+                    
+                    RemoveWindowSubclass(hwnd, EditDialogSubclassProc, subclassId);
+                    DestroyWindow(hwnd);
+                    return 0;
                 }
                 
                 case IDD_BTN_CANCEL:
-                    EndDialog(hwnd, IDCANCEL);
-                    return TRUE;
+                    g_prefillPath[0] = L'\0';
+                    g_prefillName[0] = L'\0';
+                    g_prefillStart[0] = L'\0';
+                    RemoveWindowSubclass(hwnd, EditDialogSubclassProc, subclassId);
+                    DestroyWindow(hwnd);
+                    return 0;
             }
             break;
         }
         
         case WM_CLOSE:
-            EndDialog(hwnd, IDCANCEL);
-            return TRUE;
+            g_prefillPath[0] = L'\0';
+            g_prefillName[0] = L'\0';
+            g_prefillStart[0] = L'\0';
+            RemoveWindowSubclass(hwnd, EditDialogSubclassProc, subclassId);
+            DestroyWindow(hwnd);
+            return 0;
     }
     
-    return FALSE;
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
 }
 
-// Create edit dialog
-HWND CreateEditDialog(HWND parent) {
-    // Create dialog window
+// Show edit dialog
+void ShowEditDialog(HWND parent, int index) {
     HWND hwnd = CreateWindowExW(
         WS_EX_DLGMODALFRAME,
-        L"#32770",  // Dialog class
+        L"#32770",
         L"编辑程序",
         WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME,
         CW_USEDEFAULT, CW_USEDEFAULT, 500, 400,
         parent, NULL, g_hInst, NULL
     );
     
-    if (!hwnd) return NULL;
+    if (!hwnd) return;
     
-    // Create controls
     int y = 10;
     int labelWidth = 80;
     int editWidth = 350;
     int spacing = 35;
     
-    // Name
     CreateWindowW(L"STATIC", L"名称:", WS_CHILD | WS_VISIBLE, 10, y, labelWidth, 20, hwnd, NULL, g_hInst, NULL);
     CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
         labelWidth + 10, y, editWidth, 22, hwnd, (HMENU)IDD_EDIT_NAME, g_hInst, NULL);
     y += spacing;
     
-    // Path
     CreateWindowW(L"STATIC", L"路径:", WS_CHILD | WS_VISIBLE, 10, y, labelWidth, 20, hwnd, NULL, g_hInst, NULL);
     CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
         labelWidth + 10, y, editWidth - 70, 22, hwnd, (HMENU)IDD_EDIT_PATH, g_hInst, NULL);
@@ -522,19 +536,16 @@ HWND CreateEditDialog(HWND parent) {
         labelWidth + editWidth - 60, y, 60, 22, hwnd, (HMENU)IDD_BTN_BROWSE_PATH, g_hInst, NULL);
     y += spacing;
     
-    // Param
     CreateWindowW(L"STATIC", L"参数:", WS_CHILD | WS_VISIBLE, 10, y, labelWidth, 20, hwnd, NULL, g_hInst, NULL);
     CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
         labelWidth + 10, y, editWidth, 22, hwnd, (HMENU)IDD_EDIT_PARAM, g_hInst, NULL);
     y += spacing;
     
-    // Start
     CreateWindowW(L"STATIC", L"启动路径:", WS_CHILD | WS_VISIBLE, 10, y, labelWidth, 20, hwnd, NULL, g_hInst, NULL);
     CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
         labelWidth + 10, y, editWidth, 22, hwnd, (HMENU)IDD_EDIT_START, g_hInst, NULL);
     y += spacing;
     
-    // Icon
     CreateWindowW(L"STATIC", L"图标:", WS_CHILD | WS_VISIBLE, 10, y, labelWidth, 20, hwnd, NULL, g_hInst, NULL);
     CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
         labelWidth + 10, y, editWidth - 70, 22, hwnd, (HMENU)IDD_EDIT_ICON, g_hInst, NULL);
@@ -542,13 +553,11 @@ HWND CreateEditDialog(HWND parent) {
         labelWidth + editWidth - 60, y, 60, 22, hwnd, (HMENU)IDD_BTN_BROWSE_ICON, g_hInst, NULL);
     y += spacing;
     
-    // Type
     CreateWindowW(L"STATIC", L"扩展名:", WS_CHILD | WS_VISIBLE, 10, y, labelWidth, 20, hwnd, NULL, g_hInst, NULL);
     CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
         labelWidth + 10, y, editWidth, 22, hwnd, (HMENU)IDD_EDIT_TYPE, g_hInst, NULL);
     y += spacing;
     
-    // Mode
     CreateWindowW(L"STATIC", L"打开方式:", WS_CHILD | WS_VISIBLE, 10, y, labelWidth, 20, hwnd, NULL, g_hInst, NULL);
     HWND hComboMode = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
         labelWidth + 10, y, 150, 100, hwnd, (HMENU)IDD_COMBO_MODE, g_hInst, NULL);
@@ -556,7 +565,6 @@ HWND CreateEditDialog(HWND parent) {
     SendMessageW(hComboMode, CB_ADDSTRING, 0, (LPARAM)L"合并");
     y += spacing;
     
-    // Window
     CreateWindowW(L"STATIC", L"窗口模式:", WS_CHILD | WS_VISIBLE, 10, y, labelWidth, 20, hwnd, NULL, g_hInst, NULL);
     HWND hComboWindow = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
         labelWidth + 10, y, 150, 100, hwnd, (HMENU)IDD_COMBO_WINDOW, g_hInst, NULL);
@@ -565,53 +573,54 @@ HWND CreateEditDialog(HWND parent) {
     SendMessageW(hComboWindow, CB_ADDSTRING, 0, (LPARAM)L"最小化");
     y += spacing + 10;
     
-    // Buttons
     CreateWindowW(L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
         labelWidth + editWidth - 160, y, 70, 25, hwnd, (HMENU)IDD_BTN_OK, g_hInst, NULL);
     CreateWindowW(L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
         labelWidth + editWidth - 80, y, 70, 25, hwnd, (HMENU)IDD_BTN_CANCEL, g_hInst, NULL);
     
-    return hwnd;
-}
-
-// Show edit dialog
-void ShowEditDialog(HWND parent, int index) {
-    HWND hwnd = CreateEditDialog(parent);
-    if (!hwnd) return;
+    SetWindowSubclass(hwnd, EditDialogSubclassProc, 0, 0);
     
-    // Set dialog data
-    SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)&index);
+    if (index >= 0 && index < g_programCount) {
+        ProgramConfig* prog = &g_programs[index];
+        SetDlgItemTextW(hwnd, IDD_EDIT_NAME, prog->name);
+        SetDlgItemTextW(hwnd, IDD_EDIT_PATH, prog->path);
+        SetDlgItemTextW(hwnd, IDD_EDIT_PARAM, prog->param);
+        SetDlgItemTextW(hwnd, IDD_EDIT_START, prog->start);
+        SetDlgItemTextW(hwnd, IDD_EDIT_ICON, prog->icon);
+        SetDlgItemTextW(hwnd, IDD_EDIT_TYPE, prog->type);
+        SendDlgItemMessageW(hwnd, IDD_COMBO_MODE, CB_SETCURSEL, prog->mode, 0);
+        SendDlgItemMessageW(hwnd, IDD_COMBO_WINDOW, CB_SETCURSEL, prog->window, 0);
+    } else if (wcslen(g_prefillPath) > 0) {
+        SetDlgItemTextW(hwnd, IDD_EDIT_NAME, g_prefillName);
+        SetDlgItemTextW(hwnd, IDD_EDIT_PATH, g_prefillPath);
+        SetDlgItemTextW(hwnd, IDD_EDIT_START, g_prefillStart);
+        WCHAR iconStr[MAX_PATH_LEN];
+        swprintf(iconStr, MAX_PATH_LEN, L"%s,0", g_prefillPath);
+        SetDlgItemTextW(hwnd, IDD_EDIT_ICON, iconStr);
+        SendDlgItemMessageW(hwnd, IDD_COMBO_MODE, CB_SETCURSEL, 0, 0);
+        SendDlgItemMessageW(hwnd, IDD_COMBO_WINDOW, CB_SETCURSEL, 0, 0);
+    } else {
+        SendDlgItemMessageW(hwnd, IDD_COMBO_MODE, CB_SETCURSEL, 0, 0);
+        SendDlgItemMessageW(hwnd, IDD_COMBO_WINDOW, CB_SETCURSEL, 0, 0);
+    }
     
-    // Initialize dialog
-    SendMessageW(hwnd, WM_INITDIALOG, 0, (LPARAM)&index);
+    g_editIndex = index;
     
-    // Show dialog
+    EnableWindow(parent, FALSE);
     ShowWindow(hwnd, SW_SHOW);
+    SetForegroundWindow(hwnd);
     
-    // Message loop
     MSG msg;
-    BOOL dialogActive = TRUE;
-    
-    while (dialogActive && GetMessageW(&msg, NULL, 0, 0)) {
-        if (msg.hwnd == hwnd || IsChild(hwnd, msg.hwnd)) {
-            if (msg.message == WM_COMMAND) {
-                EditDialogProc(hwnd, msg.message, msg.wParam, msg.lParam);
-                
-                if (LOWORD(msg.wParam) == IDD_BTN_OK || LOWORD(msg.wParam) == IDD_BTN_CANCEL) {
-                    dialogActive = FALSE;
-                }
-            } else if (msg.message == WM_CLOSE) {
-                dialogActive = FALSE;
-            }
-        }
-        
+    while (IsWindow(hwnd) && GetMessageW(&msg, NULL, 0, 0)) {
+        if (!IsWindow(hwnd)) break;
         if (!IsDialogMessageW(hwnd, &msg)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
     }
     
-    DestroyWindow(hwnd);
+    EnableWindow(parent, TRUE);
+    SetForegroundWindow(parent);
     PopulateListView();
 }
 
@@ -739,9 +748,59 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         
         case WM_COMMAND: {
             switch (LOWORD(wParam)) {
-                case IDC_BTN_ADD:
-                    ShowEditDialog(hwnd, -1);
+                case IDC_BTN_ADD: {
+                    // Show file open dialog first
+                    OPENFILENAMEW ofn = {0};
+                    WCHAR fileName[MAX_PATH] = {0};
+                    
+                    ofn.lStructSize = sizeof(ofn);
+                    ofn.hwndOwner = hwnd;
+                    ofn.lpstrFilter = L"可执行文件 (*.exe)\0*.exe\0所有文件 (*.*)\0*.*\0";
+                    ofn.lpstrFile = fileName;
+                    ofn.nMaxFile = MAX_PATH;
+                    ofn.lpstrTitle = L"选择要添加的程序";
+                    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+                    
+                    if (GetOpenFileNameW(&ofn)) {
+                        // Extract name: try PE version info for .exe, fallback to filename
+                        WCHAR* lastDot = wcsrchr(fileName, L'.');
+                        if (lastDot && _wcsicmp(lastDot, L".exe") == 0) {
+                            WCHAR prodName[MAX_NAME_LEN] = {0};
+                            if (GetExeProductName(fileName, prodName, MAX_NAME_LEN) && wcslen(prodName) > 0) {
+                                wcscpy_s(g_prefillName, MAX_NAME_LEN, prodName);
+                            } else {
+                                // Fallback to filename without extension
+                                WCHAR* lastSlash = wcsrchr(fileName, L'\\');
+                                WCHAR* name = lastSlash ? lastSlash + 1 : fileName;
+                                wcscpy_s(g_prefillName, MAX_NAME_LEN, name);
+                                WCHAR* dot = wcsrchr(g_prefillName, L'.');
+                                if (dot) *dot = L'\0';
+                            }
+                        } else {
+                            WCHAR* lastSlash = wcsrchr(fileName, L'\\');
+                            WCHAR* name = lastSlash ? lastSlash + 1 : fileName;
+                            wcscpy_s(g_prefillName, MAX_NAME_LEN, name);
+                            WCHAR* dot = wcsrchr(g_prefillName, L'.');
+                            if (dot) *dot = L'\0';
+                        }
+                        
+                        // Store full path
+                        wcscpy_s(g_prefillPath, MAX_PATH_LEN, fileName);
+                        
+                        // Extract directory (without trailing slash)
+                        wcscpy_s(g_prefillStart, MAX_PATH_LEN, fileName);
+                        WCHAR* lastSlash2 = wcsrchr(g_prefillStart, L'\\');
+                        if (lastSlash2) *lastSlash2 = L'\0';
+                        
+                        ShowEditDialog(hwnd, -1);
+                        
+                        // Clear pre-fill data
+                        g_prefillPath[0] = L'\0';
+                        g_prefillName[0] = L'\0';
+                        g_prefillStart[0] = L'\0';
+                    }
                     return 0;
+                }
                 
                 case IDC_BTN_EDIT: {
                     int selected = (int)SendMessageW(g_hListView, LVM_GETNEXTITEM, -1, LVNI_SELECTED);
