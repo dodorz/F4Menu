@@ -945,17 +945,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         // Store full path
                         wcscpy_s(g_prefillPath, MAX_PATH_LEN, fileName);
                         
-                        // Extract directory (without trailing slash)
-                        wcscpy_s(g_prefillStart, MAX_PATH_LEN, fileName);
-                        WCHAR* lastSlash2 = wcsrchr(g_prefillStart, L'\\');
-                        if (lastSlash2) *lastSlash2 = L'\0';
-                        
                         ShowEditDialog(hwnd, -1);
                         
                         // Clear pre-fill data
                         g_prefillPath[0] = L'\0';
                         g_prefillName[0] = L'\0';
-                        g_prefillStart[0] = L'\0';
                     }
                     return 0;
                 }
