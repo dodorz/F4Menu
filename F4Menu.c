@@ -1037,8 +1037,8 @@ int ConfigMode() {
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     wc.lpszClassName = L"F4MenuConfig";
-    wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
-    wc.hIconSm = LoadIcon(NULL, IDI_APPLICATION);
+    wc.hIcon = LoadIcon(g_hInst, MAKEINTRESOURCE(1));
+    wc.hIconSm = LoadIcon(g_hInst, MAKEINTRESOURCE(1));
     
     if (!RegisterClassExW(&wc)) {
         MessageBoxW(NULL, L"窗口类注册失败！", L"错误", MB_OK | MB_ICONERROR);

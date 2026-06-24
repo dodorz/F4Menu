@@ -8,7 +8,6 @@
 #endif
 
 // Application icon
-// Use resource ID 107 to match the provided icon name hint
-107 ICON "F4Menu_107.ico"
+1 ICON "F4Menu.ico"
 
 
