@@ -49,14 +49,16 @@
 #define IDD_EDIT_PATH 2002
 #define IDD_EDIT_PARAM 2003
 #define IDD_EDIT_START 2004
-#define IDD_EDIT_ICON 2005
+#define IDD_EDIT_ICON_FILE 2005
 #define IDD_EDIT_TYPE 2006
 #define IDD_COMBO_MODE 2007
 #define IDD_COMBO_WINDOW 2008
 #define IDD_BTN_BROWSE_PATH 2009
-#define IDD_BTN_BROWSE_ICON 2010
+#define IDD_BTN_BROWSE_ICON_FILE 2010
 #define IDD_BTN_OK 2011
 #define IDD_BTN_CANCEL 2012
+#define IDD_ICON_LIST 2013
+#define IDD_ICON_INDEX 2014
 
 // Program configuration structure
 typedef struct {
@@ -89,6 +91,7 @@ WCHAR g_prefillPath[MAX_PATH_LEN] = {0};
 WCHAR g_prefillName[MAX_NAME_LEN] = {0};
 WCHAR g_prefillStart[MAX_PATH_LEN] = {0};
 int g_editIndex = -1;
+int g_selectedIconIndex = 0;
 
 // Settings
 typedef struct {
@@ -417,6 +420,48 @@ static void SetDialogFont(HWND hDlg, HFONT hFont) {
     EnumChildWindows(hDlg, SetFontEnumProc, (LPARAM)hFont);
 }
 
+// Extract icons from file and show in icon list view
+static void ExtractAndShowIcons(HWND hDlg, const WCHAR* filePath) {
+    HWND hIconList = GetDlgItem(hDlg, IDD_ICON_LIST);
+    if (!hIconList) return;
+    
+    // Clear existing
+    ListView_DeleteAllItems(hIconList);
+    HIMAGELIST hOld = (HIMAGELIST)SendMessageW(hIconList, LVM_GETIMAGELIST, LVSIL_NORMAL, 0);
+    if (hOld) ImageList_Destroy(hOld);
+    
+    WCHAR expandedPath[MAX_PATH_LEN];
+    ExpandEnvStrings(filePath, expandedPath, MAX_PATH_LEN);
+    
+    UINT iconCount = ExtractIconExW(expandedPath, -1, NULL, NULL, 0);
+    if (iconCount == 0) return;
+    if (iconCount > 200) iconCount = 200;
+    
+    int iconSize = DPI_SCALE(32);
+    HIMAGELIST hImgList = ImageList_Create(iconSize, iconSize, ILC_COLOR32 | ILC_MASK, iconCount, 4);
+    SendMessageW(hIconList, LVM_SETIMAGELIST, LVSIL_NORMAL, (LPARAM)hImgList);
+    
+    for (UINT i = 0; i < iconCount; i++) {
+        HICON hIcon = NULL;
+        if (ExtractIconExW(expandedPath, i, &hIcon, NULL, 1) > 0 && hIcon) {
+            ImageList_AddIcon(hImgList, hIcon);
+            DestroyIcon(hIcon);
+            
+            LVITEMW item = {0};
+            item.mask = LVIF_IMAGE;
+            item.iItem = i;
+            item.iImage = i;
+            SendMessageW(hIconList, LVM_INSERTITEMW, 0, (LPARAM)&item);
+        }
+    }
+    
+    // Select first icon by default
+    if (iconCount > 0) {
+        ListView_SetItemState(hIconList, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+        g_selectedIconIndex = 0;
+    }
+}
+
 // Edit dialog subclass procedure
 LRESULT CALLBACK EditDialogSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR subclassId, DWORD_PTR refData) {
     switch (msg) {
@@ -436,17 +481,18 @@ LRESULT CALLBACK EditDialogSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     if (GetOpenFileNameW(&ofn)) {
                         SetDlgItemTextW(hwnd, IDD_EDIT_PATH, fileName);
                         
-                        WCHAR iconPath[MAX_PATH_LEN];
-                        GetDlgItemTextW(hwnd, IDD_EDIT_ICON, iconPath, MAX_PATH_LEN);
-                        if (wcslen(iconPath) == 0) {
-                            wcscat_s(fileName, MAX_PATH, L",0");
-                            SetDlgItemTextW(hwnd, IDD_EDIT_ICON, fileName);
+                        // Auto-fill icon file if empty
+                        WCHAR iconFile[MAX_PATH_LEN];
+                        GetDlgItemTextW(hwnd, IDD_EDIT_ICON_FILE, iconFile, MAX_PATH_LEN);
+                        if (wcslen(iconFile) == 0) {
+                            SetDlgItemTextW(hwnd, IDD_EDIT_ICON_FILE, fileName);
+                            ExtractAndShowIcons(hwnd, fileName);
                         }
                     }
                     return 0;
                 }
                 
-                case IDD_BTN_BROWSE_ICON: {
+                case IDD_BTN_BROWSE_ICON_FILE: {
                     OPENFILENAMEW ofn = {0};
                     WCHAR fileName[MAX_PATH] = {0};
                     
@@ -458,8 +504,28 @@ LRESULT CALLBACK EditDialogSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
                     
                     if (GetOpenFileNameW(&ofn)) {
-                        wcscat_s(fileName, MAX_PATH, L",0");
-                        SetDlgItemTextW(hwnd, IDD_EDIT_ICON, fileName);
+                        SetDlgItemTextW(hwnd, IDD_EDIT_ICON_FILE, fileName);
+                        ExtractAndShowIcons(hwnd, fileName);
+                    }
+                    return 0;
+                }
+                
+                case IDD_EDIT_ICON_FILE: {
+                    if (HIWORD(wParam) == EN_CHANGE) {
+                        WCHAR iconFile[MAX_PATH_LEN];
+                        GetDlgItemTextW(hwnd, IDD_EDIT_ICON_FILE, iconFile, MAX_PATH_LEN);
+                        if (wcslen(iconFile) > 0) {
+                            ExtractAndShowIcons(hwnd, iconFile);
+                        } else {
+                            HWND hIconList = GetDlgItem(hwnd, IDD_ICON_LIST);
+                            if (hIconList) {
+                                ListView_DeleteAllItems(hIconList);
+                                HIMAGELIST hOld = (HIMAGELIST)SendMessageW(hIconList, LVM_GETIMAGELIST, LVSIL_NORMAL, 0);
+                                if (hOld) ImageList_Destroy(hOld);
+                            }
+                            g_selectedIconIndex = 0;
+                            SetDlgItemTextW(hwnd, IDD_ICON_INDEX, L"0");
+                        }
                     }
                     return 0;
                 }
@@ -471,8 +537,14 @@ LRESULT CALLBACK EditDialogSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     GetDlgItemTextW(hwnd, IDD_EDIT_PATH, prog.path, MAX_PATH_LEN);
                     GetDlgItemTextW(hwnd, IDD_EDIT_PARAM, prog.param, MAX_PARAM_LEN);
                     GetDlgItemTextW(hwnd, IDD_EDIT_START, prog.start, MAX_PATH_LEN);
-                    GetDlgItemTextW(hwnd, IDD_EDIT_ICON, prog.icon, MAX_PATH_LEN);
                     GetDlgItemTextW(hwnd, IDD_EDIT_TYPE, prog.type, MAX_TYPE_LEN);
+                    
+                    // Build icon string from icon file path and selected index
+                    WCHAR iconFile[MAX_PATH_LEN];
+                    GetDlgItemTextW(hwnd, IDD_EDIT_ICON_FILE, iconFile, MAX_PATH_LEN);
+                    if (wcslen(iconFile) > 0) {
+                        swprintf(prog.icon, MAX_PATH_LEN, L"%s,%d", iconFile, g_selectedIconIndex);
+                    }
                     
                     prog.mode = (int)SendDlgItemMessageW(hwnd, IDD_COMBO_MODE, CB_GETCURSEL, 0, 0);
                     prog.window = (int)SendDlgItemMessageW(hwnd, IDD_COMBO_WINDOW, CB_GETCURSEL, 0, 0);
@@ -512,6 +584,22 @@ LRESULT CALLBACK EditDialogSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             break;
         }
         
+        case WM_NOTIFY: {
+            LPNMHDR nmhdr = (LPNMHDR)lParam;
+            if (nmhdr->idFrom == IDD_ICON_LIST) {
+                if (nmhdr->code == LVN_ITEMCHANGED) {
+                    LPNMLISTVIEW nmlv = (LPNMLISTVIEW)lParam;
+                    if (nmlv->uNewState & LVIS_SELECTED) {
+                        g_selectedIconIndex = nmlv->iItem;
+                        WCHAR indexStr[16];
+                        swprintf(indexStr, 16, L"%d", g_selectedIconIndex);
+                        SetDlgItemTextW(hwnd, IDD_ICON_INDEX, indexStr);
+                    }
+                }
+            }
+            break;
+        }
+        
         case WM_CLOSE:
             g_prefillPath[0] = L'\0';
             g_prefillName[0] = L'\0';
@@ -526,8 +614,10 @@ LRESULT CALLBACK EditDialogSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 
 // Show edit dialog
 void ShowEditDialog(HWND parent, int index) {
+    g_selectedIconIndex = 0;
+    
     int dlgW = DPI_SCALE(500);
-    int dlgH = DPI_SCALE(400);
+    int dlgH = DPI_SCALE(520);
     HWND hwnd = CreateWindowExW(
         WS_EX_DLGMODALFRAME,
         L"#32770",
@@ -540,68 +630,90 @@ void ShowEditDialog(HWND parent, int index) {
     if (!hwnd) return;
     
     int y = DPI_SCALE(10);
+    int lx = DPI_SCALE(10);
     int labelWidth = DPI_SCALE(80);
     int editWidth = DPI_SCALE(350);
-    int spacing = DPI_SCALE(35);
+    int spacing = DPI_SCALE(30);
     int editH = DPI_SCALE(22);
     int btnH = DPI_SCALE(25);
     int browseW = DPI_SCALE(60);
     int comboW = DPI_SCALE(150);
     int comboH = DPI_SCALE(100);
+    int iconListH = DPI_SCALE(68);
     
-    CreateWindowW(L"STATIC", L"名称:", WS_CHILD | WS_VISIBLE, DPI_SCALE(10), y, labelWidth, editH, hwnd, NULL, g_hInst, NULL);
+    // 名称
+    CreateWindowW(L"STATIC", L"名称:", WS_CHILD | WS_VISIBLE, lx, y, labelWidth, editH, hwnd, NULL, g_hInst, NULL);
     CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-        labelWidth + DPI_SCALE(10), y, editWidth, editH, hwnd, (HMENU)IDD_EDIT_NAME, g_hInst, NULL);
+        lx + labelWidth, y, editWidth, editH, hwnd, (HMENU)IDD_EDIT_NAME, g_hInst, NULL);
     y += spacing;
     
-    CreateWindowW(L"STATIC", L"路径:", WS_CHILD | WS_VISIBLE, DPI_SCALE(10), y, labelWidth, editH, hwnd, NULL, g_hInst, NULL);
+    // 路径
+    CreateWindowW(L"STATIC", L"路径:", WS_CHILD | WS_VISIBLE, lx, y, labelWidth, editH, hwnd, NULL, g_hInst, NULL);
     CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-        labelWidth + DPI_SCALE(10), y, editWidth - browseW - DPI_SCALE(10), editH, hwnd, (HMENU)IDD_EDIT_PATH, g_hInst, NULL);
+        lx + labelWidth, y, editWidth - browseW - DPI_SCALE(5), editH, hwnd, (HMENU)IDD_EDIT_PATH, g_hInst, NULL);
     CreateWindowW(L"BUTTON", L"浏览...", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-        labelWidth + editWidth - browseW, y, browseW, editH, hwnd, (HMENU)IDD_BTN_BROWSE_PATH, g_hInst, NULL);
+        lx + labelWidth + editWidth - browseW, y, browseW, editH, hwnd, (HMENU)IDD_BTN_BROWSE_PATH, g_hInst, NULL);
     y += spacing;
     
-    CreateWindowW(L"STATIC", L"参数:", WS_CHILD | WS_VISIBLE, DPI_SCALE(10), y, labelWidth, editH, hwnd, NULL, g_hInst, NULL);
+    // 参数
+    CreateWindowW(L"STATIC", L"参数:", WS_CHILD | WS_VISIBLE, lx, y, labelWidth, editH, hwnd, NULL, g_hInst, NULL);
     CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-        labelWidth + DPI_SCALE(10), y, editWidth, editH, hwnd, (HMENU)IDD_EDIT_PARAM, g_hInst, NULL);
+        lx + labelWidth, y, editWidth, editH, hwnd, (HMENU)IDD_EDIT_PARAM, g_hInst, NULL);
     y += spacing;
     
-    CreateWindowW(L"STATIC", L"启动路径:", WS_CHILD | WS_VISIBLE, DPI_SCALE(10), y, labelWidth, editH, hwnd, NULL, g_hInst, NULL);
+    // 启动路径
+    CreateWindowW(L"STATIC", L"启动路径:", WS_CHILD | WS_VISIBLE, lx, y, labelWidth, editH, hwnd, NULL, g_hInst, NULL);
     CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-        labelWidth + DPI_SCALE(10), y, editWidth, editH, hwnd, (HMENU)IDD_EDIT_START, g_hInst, NULL);
+        lx + labelWidth, y, editWidth, editH, hwnd, (HMENU)IDD_EDIT_START, g_hInst, NULL);
     y += spacing;
     
-    CreateWindowW(L"STATIC", L"图标:", WS_CHILD | WS_VISIBLE, DPI_SCALE(10), y, labelWidth, editH, hwnd, NULL, g_hInst, NULL);
-    CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-        labelWidth + DPI_SCALE(10), y, editWidth - browseW - DPI_SCALE(10), editH, hwnd, (HMENU)IDD_EDIT_ICON, g_hInst, NULL);
-    CreateWindowW(L"BUTTON", L"浏览...", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-        labelWidth + editWidth - browseW, y, browseW, editH, hwnd, (HMENU)IDD_BTN_BROWSE_ICON, g_hInst, NULL);
-    y += spacing;
-    
-    CreateWindowW(L"STATIC", L"扩展名:", WS_CHILD | WS_VISIBLE, DPI_SCALE(10), y, labelWidth, editH, hwnd, NULL, g_hInst, NULL);
-    CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-        labelWidth + DPI_SCALE(10), y, editWidth, editH, hwnd, (HMENU)IDD_EDIT_TYPE, g_hInst, NULL);
-    y += spacing;
-    
-    CreateWindowW(L"STATIC", L"打开方式:", WS_CHILD | WS_VISIBLE, DPI_SCALE(10), y, labelWidth, editH, hwnd, NULL, g_hInst, NULL);
+    // 打开方式
+    CreateWindowW(L"STATIC", L"打开方式:", WS_CHILD | WS_VISIBLE, lx, y, labelWidth, editH, hwnd, NULL, g_hInst, NULL);
     HWND hComboMode = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
-        labelWidth + DPI_SCALE(10), y, comboW, comboH, hwnd, (HMENU)IDD_COMBO_MODE, g_hInst, NULL);
+        lx + labelWidth, y, comboW, comboH, hwnd, (HMENU)IDD_COMBO_MODE, g_hInst, NULL);
     SendMessageW(hComboMode, CB_ADDSTRING, 0, (LPARAM)L"独立");
     SendMessageW(hComboMode, CB_ADDSTRING, 0, (LPARAM)L"合并");
     y += spacing;
     
-    CreateWindowW(L"STATIC", L"窗口模式:", WS_CHILD | WS_VISIBLE, DPI_SCALE(10), y, labelWidth, editH, hwnd, NULL, g_hInst, NULL);
+    // 窗口模式
+    CreateWindowW(L"STATIC", L"窗口模式:", WS_CHILD | WS_VISIBLE, lx, y, labelWidth, editH, hwnd, NULL, g_hInst, NULL);
     HWND hComboWindow = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
-        labelWidth + DPI_SCALE(10), y, comboW, comboH, hwnd, (HMENU)IDD_COMBO_WINDOW, g_hInst, NULL);
+        lx + labelWidth, y, comboW, comboH, hwnd, (HMENU)IDD_COMBO_WINDOW, g_hInst, NULL);
     SendMessageW(hComboWindow, CB_ADDSTRING, 0, (LPARAM)L"常规");
     SendMessageW(hComboWindow, CB_ADDSTRING, 0, (LPARAM)L"最大化");
     SendMessageW(hComboWindow, CB_ADDSTRING, 0, (LPARAM)L"最小化");
+    y += spacing;
+    
+    // 图标文件
+    CreateWindowW(L"STATIC", L"图标文件:", WS_CHILD | WS_VISIBLE, lx, y, labelWidth, editH, hwnd, NULL, g_hInst, NULL);
+    CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+        lx + labelWidth, y, editWidth - browseW - DPI_SCALE(5), editH, hwnd, (HMENU)IDD_EDIT_ICON_FILE, g_hInst, NULL);
+    CreateWindowW(L"BUTTON", L"浏览...", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        lx + labelWidth + editWidth - browseW, y, browseW, editH, hwnd, (HMENU)IDD_BTN_BROWSE_ICON_FILE, g_hInst, NULL);
+    y += spacing;
+    
+    // 图标 (index label + icon list)
+    CreateWindowW(L"STATIC", L"图标:", WS_CHILD | WS_VISIBLE, lx, y, labelWidth, editH, hwnd, NULL, g_hInst, NULL);
+    CreateWindowW(L"STATIC", L"0", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, lx + labelWidth, y, DPI_SCALE(30), editH, hwnd, (HMENU)IDD_ICON_INDEX, g_hInst, NULL);
+    
+    HWND hIconList = CreateWindowExW(0, WC_LISTVIEWW, L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_ICON | LVS_SHOWSELALWAYS | LVS_SINGLESEL | WS_BORDER,
+        lx + labelWidth + DPI_SCALE(35), y, editWidth - DPI_SCALE(35), iconListH,
+        hwnd, (HMENU)IDD_ICON_LIST, g_hInst, NULL);
+    SendMessageW(hIconList, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, LVS_EX_DOUBLEBUFFER);
+    y += iconListH + DPI_SCALE(5);
+    
+    // 扩展名
+    CreateWindowW(L"STATIC", L"扩展名:", WS_CHILD | WS_VISIBLE, lx, y, labelWidth, editH, hwnd, NULL, g_hInst, NULL);
+    CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+        lx + labelWidth, y, editWidth, editH, hwnd, (HMENU)IDD_EDIT_TYPE, g_hInst, NULL);
     y += spacing + DPI_SCALE(10);
     
+    // 按钮
     CreateWindowW(L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-        labelWidth + editWidth - DPI_SCALE(160), y, DPI_SCALE(70), btnH, hwnd, (HMENU)IDD_BTN_OK, g_hInst, NULL);
+        lx + labelWidth + editWidth - DPI_SCALE(160), y, DPI_SCALE(70), btnH, hwnd, (HMENU)IDD_BTN_OK, g_hInst, NULL);
     CreateWindowW(L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-        labelWidth + editWidth - DPI_SCALE(80), y, DPI_SCALE(70), btnH, hwnd, (HMENU)IDD_BTN_CANCEL, g_hInst, NULL);
+        lx + labelWidth + editWidth - DPI_SCALE(80), y, DPI_SCALE(70), btnH, hwnd, (HMENU)IDD_BTN_CANCEL, g_hInst, NULL);
     
     SetDialogFont(hwnd, g_hFont);
     
@@ -613,17 +725,33 @@ void ShowEditDialog(HWND parent, int index) {
         SetDlgItemTextW(hwnd, IDD_EDIT_PATH, prog->path);
         SetDlgItemTextW(hwnd, IDD_EDIT_PARAM, prog->param);
         SetDlgItemTextW(hwnd, IDD_EDIT_START, prog->start);
-        SetDlgItemTextW(hwnd, IDD_EDIT_ICON, prog->icon);
         SetDlgItemTextW(hwnd, IDD_EDIT_TYPE, prog->type);
         SendDlgItemMessageW(hwnd, IDD_COMBO_MODE, CB_SETCURSEL, prog->mode, 0);
         SendDlgItemMessageW(hwnd, IDD_COMBO_WINDOW, CB_SETCURSEL, prog->window, 0);
+        
+        // Parse icon string "path,index"
+        WCHAR* comma = wcsrchr(prog->icon, L',');
+        if (comma) {
+            *comma = L'\0';
+            g_selectedIconIndex = _wtoi(comma + 1);
+            SetDlgItemTextW(hwnd, IDD_EDIT_ICON_FILE, prog->icon);
+            WCHAR idxStr[16];
+            swprintf(idxStr, 16, L"%d", g_selectedIconIndex);
+            SetDlgItemTextW(hwnd, IDD_ICON_INDEX, idxStr);
+            ExtractAndShowIcons(hwnd, prog->icon);
+            *comma = L',';
+            
+            // Select the correct icon
+            if (g_selectedIconIndex >= 0) {
+                ListView_SetItemState(hIconList, g_selectedIconIndex, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+            }
+        }
     } else if (wcslen(g_prefillPath) > 0) {
         SetDlgItemTextW(hwnd, IDD_EDIT_NAME, g_prefillName);
         SetDlgItemTextW(hwnd, IDD_EDIT_PATH, g_prefillPath);
         SetDlgItemTextW(hwnd, IDD_EDIT_START, g_prefillStart);
-        WCHAR iconStr[MAX_PATH_LEN];
-        swprintf(iconStr, MAX_PATH_LEN, L"%s,0", g_prefillPath);
-        SetDlgItemTextW(hwnd, IDD_EDIT_ICON, iconStr);
+        SetDlgItemTextW(hwnd, IDD_EDIT_ICON_FILE, g_prefillPath);
+        ExtractAndShowIcons(hwnd, g_prefillPath);
         SendDlgItemMessageW(hwnd, IDD_COMBO_MODE, CB_SETCURSEL, 0, 0);
         SendDlgItemMessageW(hwnd, IDD_COMBO_WINDOW, CB_SETCURSEL, 0, 0);
     } else {
