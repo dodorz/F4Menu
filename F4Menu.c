@@ -31,9 +31,7 @@
 #pragma comment(lib, "version.lib")
 
 // Constants
-#ifndef F4MENU_VERSION
-#define F4MENU_VERSION "1.0.0"
-#endif
+#include "version.h"
 
 #define MAX_PROGRAMS 100
 #define MAX_PATH_LEN 1024
@@ -879,7 +877,7 @@ void ShowAboutDialog(HWND parent) {
         L"使用纯 Win32 API 开发\n"
         L"兼容 Windows XP 到 Windows 11\n\n"
         L"© %d",
-        F4MENU_VERSION, year);
+        F4MENU_VERSION_A, year);
     
     MessageBoxW(parent, msg, L"关于 F4Menu", MB_OK | MB_ICONINFORMATION);
 }
