@@ -96,7 +96,7 @@
   <ItemGroup>
     <ClCompile Include="F4Menu.c" />
   </ItemGroup>
-  <ItemGroup Condition="Exists('F4Menu_107.ico')">
+  <ItemGroup Condition="Exists('F4Menu.ico')">
     <ResourceCompile Include="F4Menu.rc" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
