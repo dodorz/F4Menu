@@ -1229,11 +1229,25 @@ void LaunchMode(int argc, WCHAR** argv) {
     POINT pt;
     GetCursorPos(&pt);
     
-    // Show menu
-    SetForegroundWindow(GetDesktopWindow());
-    int selected = TrackPopupMenuEx(hMenu, TPM_RETURNCMD | TPM_LEFTBUTTON, 
-        pt.x, pt.y, GetDesktopWindow(), NULL);
+    // Create hidden message-only window as menu owner (fixes popup not appearing)
+    WNDCLASSEXW wcMenu = {0};
+    wcMenu.cbSize = sizeof(WNDCLASSEXW);
+    wcMenu.lpfnWndProc = DefWindowProcW;
+    wcMenu.hInstance = g_hInst;
+    wcMenu.lpszClassName = L"F4MenuPopupHost";
+    RegisterClassExW(&wcMenu);
     
+    HWND hHost = CreateWindowExW(0, L"F4MenuPopupHost", L"", WS_OVERLAPPED,
+        0, 0, 0, 0, HWND_MESSAGE, NULL, g_hInst, NULL);
+    
+    // Show menu
+    SetForegroundWindow(hHost);
+    int selected = TrackPopupMenuEx(hMenu, TPM_RETURNCMD | TPM_LEFTBUTTON, 
+        pt.x, pt.y, hHost, NULL);
+    PostMessage(hHost, WM_NULL, 0, 0);
+    
+    DestroyWindow(hHost);
+    UnregisterClassW(L"F4MenuPopupHost", g_hInst);
     DestroyMenu(hMenu);
     
     if (selected > 0) {
