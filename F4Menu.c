@@ -1270,9 +1270,16 @@ void LaunchMode(int argc, WCHAR** argv) {
     for (int i = 0; i < g_programCount; i++) {
         MENUITEMINFOW mii = {0};
         mii.cbSize = sizeof(mii);
-        mii.fMask = MIIM_STRING | MIIM_ID | MIIM_BITMAP;
+        mii.fMask = MIIM_STRING | MIIM_ID | MIIM_BITMAP | MIIM_STATE;
         mii.wID = 10000 + i;
         mii.dwTypeData = g_programs[i].name;
+        
+        // Check if program path exists
+        WCHAR expandedPath[MAX_PATH_LEN];
+        ExpandEnvStrings(g_programs[i].path, expandedPath, MAX_PATH_LEN);
+        if (GetFileAttributesW(expandedPath) == INVALID_FILE_ATTRIBUTES) {
+            mii.fState = MFS_DISABLED | MFS_GRAYED;
+        }
         
         HICON hIcon = LoadIconFromPath(g_programs[i].icon);
         if (hIcon) {
