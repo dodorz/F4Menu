@@ -71,6 +71,10 @@ typedef struct {
     int main;      // Reserved
 } ProgramConfig;
 
+// DPI scaling
+int g_dpi = 96;
+#define DPI_SCALE(val) MulDiv(val, g_dpi, 96)
+
 // Global variables
 HINSTANCE g_hInst;
 WCHAR g_iniPath[MAX_PATH];
@@ -78,6 +82,7 @@ ProgramConfig g_programs[MAX_PROGRAMS];
 int g_programCount = 0;
 HWND g_hListView = NULL;
 HIMAGELIST g_hImageList = NULL;
+HFONT g_hFont = NULL;
 
 // Pre-fill data for add dialog
 WCHAR g_prefillPath[MAX_PATH_LEN] = {0};
@@ -182,8 +187,8 @@ void LoadSettings() {
     g_settings.winHeight = HIWORD(winSize);
     
     // Default window size if invalid
-    if (g_settings.winWidth < 400) g_settings.winWidth = 800;
-    if (g_settings.winHeight < 300) g_settings.winHeight = 600;
+    if (g_settings.winWidth < DPI_SCALE(400)) g_settings.winWidth = DPI_SCALE(800);
+    if (g_settings.winHeight < DPI_SCALE(300)) g_settings.winHeight = DPI_SCALE(600);
     
     // Load column widths
     WCHAR columnStr[512] = {0};
@@ -328,12 +333,16 @@ HICON LoadIconFromPath(const WCHAR* iconPath) {
 void InitListView(HWND hwnd) {
     g_hListView = GetDlgItem(hwnd, IDC_LISTVIEW);
     
+    // Apply font
+    SendMessageW(g_hListView, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+    
     // Set extended styles
     DWORD exStyle = LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER;
     SendMessageW(g_hListView, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, exStyle);
     
-    // Create image list for icons
-    g_hImageList = ImageList_Create(16, 16, ILC_COLOR32 | ILC_MASK, 10, 10);
+    // Create image list for icons (DPI-scaled)
+    int iconSize = DPI_SCALE(16);
+    g_hImageList = ImageList_Create(iconSize, iconSize, ILC_COLOR32 | ILC_MASK, 10, 10);
     SendMessageW(g_hListView, LVM_SETIMAGELIST, LVSIL_SMALL, (LPARAM)g_hImageList);
     
     // Add columns
@@ -397,6 +406,15 @@ void PopulateListView() {
     for (int i = 0; i < g_programCount; i++) {
         AddProgramToListView(i);
     }
+}
+
+static BOOL CALLBACK SetFontEnumProc(HWND hwnd, LPARAM lParam) {
+    SendMessageW(hwnd, WM_SETFONT, (WPARAM)lParam, TRUE);
+    return TRUE;
+}
+
+static void SetDialogFont(HWND hDlg, HFONT hFont) {
+    EnumChildWindows(hDlg, SetFontEnumProc, (LPARAM)hFont);
 }
 
 // Edit dialog subclass procedure
@@ -508,75 +526,84 @@ LRESULT CALLBACK EditDialogSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 
 // Show edit dialog
 void ShowEditDialog(HWND parent, int index) {
+    int dlgW = DPI_SCALE(500);
+    int dlgH = DPI_SCALE(400);
     HWND hwnd = CreateWindowExW(
         WS_EX_DLGMODALFRAME,
         L"#32770",
         L"编辑程序",
         WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME,
-        CW_USEDEFAULT, CW_USEDEFAULT, 500, 400,
+        CW_USEDEFAULT, CW_USEDEFAULT, dlgW, dlgH,
         parent, NULL, g_hInst, NULL
     );
     
     if (!hwnd) return;
     
-    int y = 10;
-    int labelWidth = 80;
-    int editWidth = 350;
-    int spacing = 35;
+    int y = DPI_SCALE(10);
+    int labelWidth = DPI_SCALE(80);
+    int editWidth = DPI_SCALE(350);
+    int spacing = DPI_SCALE(35);
+    int editH = DPI_SCALE(22);
+    int btnH = DPI_SCALE(25);
+    int browseW = DPI_SCALE(60);
+    int comboW = DPI_SCALE(150);
+    int comboH = DPI_SCALE(100);
     
-    CreateWindowW(L"STATIC", L"名称:", WS_CHILD | WS_VISIBLE, 10, y, labelWidth, 20, hwnd, NULL, g_hInst, NULL);
+    CreateWindowW(L"STATIC", L"名称:", WS_CHILD | WS_VISIBLE, DPI_SCALE(10), y, labelWidth, editH, hwnd, NULL, g_hInst, NULL);
     CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-        labelWidth + 10, y, editWidth, 22, hwnd, (HMENU)IDD_EDIT_NAME, g_hInst, NULL);
+        labelWidth + DPI_SCALE(10), y, editWidth, editH, hwnd, (HMENU)IDD_EDIT_NAME, g_hInst, NULL);
     y += spacing;
     
-    CreateWindowW(L"STATIC", L"路径:", WS_CHILD | WS_VISIBLE, 10, y, labelWidth, 20, hwnd, NULL, g_hInst, NULL);
+    CreateWindowW(L"STATIC", L"路径:", WS_CHILD | WS_VISIBLE, DPI_SCALE(10), y, labelWidth, editH, hwnd, NULL, g_hInst, NULL);
     CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-        labelWidth + 10, y, editWidth - 70, 22, hwnd, (HMENU)IDD_EDIT_PATH, g_hInst, NULL);
+        labelWidth + DPI_SCALE(10), y, editWidth - browseW - DPI_SCALE(10), editH, hwnd, (HMENU)IDD_EDIT_PATH, g_hInst, NULL);
     CreateWindowW(L"BUTTON", L"浏览...", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-        labelWidth + editWidth - 60, y, 60, 22, hwnd, (HMENU)IDD_BTN_BROWSE_PATH, g_hInst, NULL);
+        labelWidth + editWidth - browseW, y, browseW, editH, hwnd, (HMENU)IDD_BTN_BROWSE_PATH, g_hInst, NULL);
     y += spacing;
     
-    CreateWindowW(L"STATIC", L"参数:", WS_CHILD | WS_VISIBLE, 10, y, labelWidth, 20, hwnd, NULL, g_hInst, NULL);
+    CreateWindowW(L"STATIC", L"参数:", WS_CHILD | WS_VISIBLE, DPI_SCALE(10), y, labelWidth, editH, hwnd, NULL, g_hInst, NULL);
     CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-        labelWidth + 10, y, editWidth, 22, hwnd, (HMENU)IDD_EDIT_PARAM, g_hInst, NULL);
+        labelWidth + DPI_SCALE(10), y, editWidth, editH, hwnd, (HMENU)IDD_EDIT_PARAM, g_hInst, NULL);
     y += spacing;
     
-    CreateWindowW(L"STATIC", L"启动路径:", WS_CHILD | WS_VISIBLE, 10, y, labelWidth, 20, hwnd, NULL, g_hInst, NULL);
+    CreateWindowW(L"STATIC", L"启动路径:", WS_CHILD | WS_VISIBLE, DPI_SCALE(10), y, labelWidth, editH, hwnd, NULL, g_hInst, NULL);
     CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-        labelWidth + 10, y, editWidth, 22, hwnd, (HMENU)IDD_EDIT_START, g_hInst, NULL);
+        labelWidth + DPI_SCALE(10), y, editWidth, editH, hwnd, (HMENU)IDD_EDIT_START, g_hInst, NULL);
     y += spacing;
     
-    CreateWindowW(L"STATIC", L"图标:", WS_CHILD | WS_VISIBLE, 10, y, labelWidth, 20, hwnd, NULL, g_hInst, NULL);
+    CreateWindowW(L"STATIC", L"图标:", WS_CHILD | WS_VISIBLE, DPI_SCALE(10), y, labelWidth, editH, hwnd, NULL, g_hInst, NULL);
     CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-        labelWidth + 10, y, editWidth - 70, 22, hwnd, (HMENU)IDD_EDIT_ICON, g_hInst, NULL);
+        labelWidth + DPI_SCALE(10), y, editWidth - browseW - DPI_SCALE(10), editH, hwnd, (HMENU)IDD_EDIT_ICON, g_hInst, NULL);
     CreateWindowW(L"BUTTON", L"浏览...", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-        labelWidth + editWidth - 60, y, 60, 22, hwnd, (HMENU)IDD_BTN_BROWSE_ICON, g_hInst, NULL);
+        labelWidth + editWidth - browseW, y, browseW, editH, hwnd, (HMENU)IDD_BTN_BROWSE_ICON, g_hInst, NULL);
     y += spacing;
     
-    CreateWindowW(L"STATIC", L"扩展名:", WS_CHILD | WS_VISIBLE, 10, y, labelWidth, 20, hwnd, NULL, g_hInst, NULL);
+    CreateWindowW(L"STATIC", L"扩展名:", WS_CHILD | WS_VISIBLE, DPI_SCALE(10), y, labelWidth, editH, hwnd, NULL, g_hInst, NULL);
     CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-        labelWidth + 10, y, editWidth, 22, hwnd, (HMENU)IDD_EDIT_TYPE, g_hInst, NULL);
+        labelWidth + DPI_SCALE(10), y, editWidth, editH, hwnd, (HMENU)IDD_EDIT_TYPE, g_hInst, NULL);
     y += spacing;
     
-    CreateWindowW(L"STATIC", L"打开方式:", WS_CHILD | WS_VISIBLE, 10, y, labelWidth, 20, hwnd, NULL, g_hInst, NULL);
+    CreateWindowW(L"STATIC", L"打开方式:", WS_CHILD | WS_VISIBLE, DPI_SCALE(10), y, labelWidth, editH, hwnd, NULL, g_hInst, NULL);
     HWND hComboMode = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
-        labelWidth + 10, y, 150, 100, hwnd, (HMENU)IDD_COMBO_MODE, g_hInst, NULL);
+        labelWidth + DPI_SCALE(10), y, comboW, comboH, hwnd, (HMENU)IDD_COMBO_MODE, g_hInst, NULL);
     SendMessageW(hComboMode, CB_ADDSTRING, 0, (LPARAM)L"独立");
     SendMessageW(hComboMode, CB_ADDSTRING, 0, (LPARAM)L"合并");
     y += spacing;
     
-    CreateWindowW(L"STATIC", L"窗口模式:", WS_CHILD | WS_VISIBLE, 10, y, labelWidth, 20, hwnd, NULL, g_hInst, NULL);
+    CreateWindowW(L"STATIC", L"窗口模式:", WS_CHILD | WS_VISIBLE, DPI_SCALE(10), y, labelWidth, editH, hwnd, NULL, g_hInst, NULL);
     HWND hComboWindow = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
-        labelWidth + 10, y, 150, 100, hwnd, (HMENU)IDD_COMBO_WINDOW, g_hInst, NULL);
+        labelWidth + DPI_SCALE(10), y, comboW, comboH, hwnd, (HMENU)IDD_COMBO_WINDOW, g_hInst, NULL);
     SendMessageW(hComboWindow, CB_ADDSTRING, 0, (LPARAM)L"常规");
     SendMessageW(hComboWindow, CB_ADDSTRING, 0, (LPARAM)L"最大化");
     SendMessageW(hComboWindow, CB_ADDSTRING, 0, (LPARAM)L"最小化");
-    y += spacing + 10;
+    y += spacing + DPI_SCALE(10);
     
     CreateWindowW(L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-        labelWidth + editWidth - 160, y, 70, 25, hwnd, (HMENU)IDD_BTN_OK, g_hInst, NULL);
+        labelWidth + editWidth - DPI_SCALE(160), y, DPI_SCALE(70), btnH, hwnd, (HMENU)IDD_BTN_OK, g_hInst, NULL);
     CreateWindowW(L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-        labelWidth + editWidth - 80, y, 70, 25, hwnd, (HMENU)IDD_BTN_CANCEL, g_hInst, NULL);
+        labelWidth + editWidth - DPI_SCALE(80), y, DPI_SCALE(70), btnH, hwnd, (HMENU)IDD_BTN_CANCEL, g_hInst, NULL);
+    
+    SetDialogFont(hwnd, g_hFont);
     
     SetWindowSubclass(hwnd, EditDialogSubclassProc, 0, 0);
     
@@ -680,7 +707,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 WC_LISTVIEWW,
                 L"",
                 WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SHOWSELALWAYS | WS_BORDER,
-                10, 10, 760, 480,
+                DPI_SCALE(10), DPI_SCALE(10), DPI_SCALE(760), DPI_SCALE(480),
                 hwnd, (HMENU)IDC_LISTVIEW, g_hInst, NULL
             );
             
@@ -688,33 +715,36 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             PopulateListView();
             
             // Create buttons
-            int btnY = 500;
-            int btnX = 10;
-            int btnWidth = 80;
-            int btnSpacing = 90;
+            int btnY = DPI_SCALE(500);
+            int btnX = DPI_SCALE(10);
+            int btnWidth = DPI_SCALE(80);
+            int btnHeight = DPI_SCALE(30);
+            int btnSpacing = DPI_SCALE(90);
             
             CreateWindowW(L"BUTTON", L"添加", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                btnX, btnY, btnWidth, 30, hwnd, (HMENU)IDC_BTN_ADD, g_hInst, NULL);
+                btnX, btnY, btnWidth, btnHeight, hwnd, (HMENU)IDC_BTN_ADD, g_hInst, NULL);
             btnX += btnSpacing;
             
             CreateWindowW(L"BUTTON", L"编辑", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                btnX, btnY, btnWidth, 30, hwnd, (HMENU)IDC_BTN_EDIT, g_hInst, NULL);
+                btnX, btnY, btnWidth, btnHeight, hwnd, (HMENU)IDC_BTN_EDIT, g_hInst, NULL);
             btnX += btnSpacing;
             
             CreateWindowW(L"BUTTON", L"删除", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                btnX, btnY, btnWidth, 30, hwnd, (HMENU)IDC_BTN_DELETE, g_hInst, NULL);
+                btnX, btnY, btnWidth, btnHeight, hwnd, (HMENU)IDC_BTN_DELETE, g_hInst, NULL);
             btnX += btnSpacing;
             
             CreateWindowW(L"BUTTON", L"保存", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                btnX, btnY, btnWidth, 30, hwnd, (HMENU)IDC_BTN_SAVE, g_hInst, NULL);
+                btnX, btnY, btnWidth, btnHeight, hwnd, (HMENU)IDC_BTN_SAVE, g_hInst, NULL);
             btnX += btnSpacing;
             
             CreateWindowW(L"BUTTON", L"关于", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                btnX, btnY, btnWidth, 30, hwnd, (HMENU)IDC_BTN_ABOUT, g_hInst, NULL);
+                btnX, btnY, btnWidth, btnHeight, hwnd, (HMENU)IDC_BTN_ABOUT, g_hInst, NULL);
             btnX += btnSpacing;
             
             CreateWindowW(L"BUTTON", L"退出", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                btnX, btnY, btnWidth, 30, hwnd, (HMENU)IDC_BTN_EXIT, g_hInst, NULL);
+                btnX, btnY, btnWidth, btnHeight, hwnd, (HMENU)IDC_BTN_EXIT, g_hInst, NULL);
+            
+            SetDialogFont(hwnd, g_hFont);
             
             return 0;
         }
@@ -724,12 +754,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             int height = HIWORD(lParam);
             
             // Resize ListView
-            SetWindowPos(g_hListView, NULL, 10, 10, width - 20, height - 60, SWP_NOZORDER);
+            SetWindowPos(g_hListView, NULL, DPI_SCALE(10), DPI_SCALE(10), width - DPI_SCALE(20), height - DPI_SCALE(60), SWP_NOZORDER);
             
             // Reposition buttons
-            int btnY = height - 40;
-            int btnX = 10;
-            int btnSpacing = 90;
+            int btnY = height - DPI_SCALE(40);
+            int btnX = DPI_SCALE(10);
+            int btnSpacing = DPI_SCALE(90);
             
             SetWindowPos(GetDlgItem(hwnd, IDC_BTN_ADD), NULL, btnX, btnY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
             btnX += btnSpacing;
@@ -860,6 +890,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_DESTROY:
             if (g_hImageList) {
                 ImageList_Destroy(g_hImageList);
+            }
+            if (g_hFont) {
+                DeleteObject(g_hFont);
+                g_hFont = NULL;
             }
             PostQuitMessage(0);
             return 0;
@@ -1088,6 +1122,39 @@ void LaunchMode(int argc, WCHAR** argv) {
 // Entry point
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int nCmdShow) {
     g_hInst = hInstance;
+    
+    // Enable DPI awareness (Vista+)
+    {
+        typedef BOOL (WINAPI *PFN_SetProcessDPIAware)(void);
+        HMODULE hUser32 = GetModuleHandleW(L"user32.dll");
+        if (hUser32) {
+            PFN_SetProcessDPIAware pfn = (PFN_SetProcessDPIAware)GetProcAddress(hUser32, "SetProcessDPIAware");
+            if (pfn) pfn();
+        }
+    }
+    
+    // Get system DPI
+    {
+        HDC hScreenDC = GetDC(NULL);
+        if (hScreenDC) {
+            g_dpi = GetDeviceCaps(hScreenDC, LOGPIXELSY);
+            ReleaseDC(NULL, hScreenDC);
+        }
+    }
+    
+    // Create UI font (Microsoft YaHei UI, scaled to DPI)
+    g_hFont = CreateFontW(
+        -DPI_SCALE(12), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS,
+        L"Microsoft YaHei UI");
+    if (!g_hFont) {
+        g_hFont = CreateFontW(
+            -DPI_SCALE(12), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS,
+            L"Segoe UI");
+    }
     
     // Initialize common controls
     INITCOMMONCONTROLSEX icc = {0};
