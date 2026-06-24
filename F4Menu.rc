@@ -1,6 +1,5 @@
-// F4Menu resource script for application icon
+// F4Menu resource script
 
-// Include default resource defines for MSVC rc.exe compatibility
 #ifdef APSTUDIO_INVOKED
 #ifndef APSTUDIO_READONLY_SYMBOLS
 #define APSTUDIO_READONLY_SYMBOLS
@@ -10,4 +9,51 @@
 // Application icon
 1 ICON "F4Menu.ico"
 
+// Version info - set via /D compiler flag (e.g. /DF4MENU_VERSION_A="1.2.3")
+#ifndef F4MENU_VERSION_A
+#define F4MENU_VERSION_A "1.0.0"
+#endif
+#ifndef F4MENU_VER_MAJOR
+#define F4MENU_VER_MAJOR 1
+#endif
+#ifndef F4MENU_VER_MINOR
+#define F4MENU_VER_MINOR 0
+#endif
+#ifndef F4MENU_VER_PATCH
+#define F4MENU_VER_PATCH 0
+#endif
+#ifndef F4MENU_VER_BUILD
+#define F4MENU_VER_BUILD 0
+#endif
 
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION F4MENU_VER_MAJOR,F4MENU_VER_MINOR,F4MENU_VER_PATCH,F4MENU_VER_BUILD
+ PRODUCTVERSION F4MENU_VER_MAJOR,F4MENU_VER_MINOR,F4MENU_VER_PATCH,F4MENU_VER_BUILD
+ FILEFLAGSMASK 0x3fL
+#ifdef _DEBUG
+ FILEFLAGS 0x1L
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName", "F4Menu"
+            VALUE "FileDescription", "F4Menu"
+            VALUE "FileVersion", F4MENU_VERSION_A
+            VALUE "InternalName", "F4Menu"
+            VALUE "OriginalFilename", "F4Menu.exe"
+            VALUE "ProductName", "F4Menu"
+            VALUE "ProductVersion", F4MENU_VERSION_A
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END

@@ -15,21 +15,36 @@ jobs:
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 
-      - name: Build x64
-        run: msbuild F4Menu.vcxproj /p:Configuration=Release /p:Platform=x64 /v:minimal
-
-      - name: Build Win32
-        run: msbuild F4Menu.vcxproj /p:Configuration=Release /p:Platform=Win32 /v:minimal
-
-      - name: Get version from tag
+      - name: Parse version
         id: version
         shell: bash
-        run: echo "VERSION=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          MAJOR=$(echo "$TAG" | cut -d. -f1)
+          MINOR=$(echo "$TAG" | cut -d. -f2)
+          PATCH=$(echo "$TAG" | cut -d. -f3)
+          # Handle pre-release suffix (e.g. 1.0.0-beta.1 -> BUILD=1)
+          BUILD=$(echo "$TAG" | grep -oP '(?<=-)\d+$' || echo "0")
+          echo "MAJOR=$MAJOR" >> "$GITHUB_OUTPUT"
+          echo "MINOR=$MINOR" >> "$GITHUB_OUTPUT"
+          echo "PATCH=$PATCH" >> "$GITHUB_OUTPUT"
+          echo "BUILD=$BUILD" >> "$GITHUB_OUTPUT"
+          echo "TAG=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Build x64
+        run: >
+          msbuild F4Menu.vcxproj /p:Configuration=Release /p:Platform=x64 /v:minimal
+          /p:DefineConstants="F4MENU_VERSION_A=${{ steps.version.outputs.TAG }}"
+          /p:AdditionalOptions="/DF4MENU_VERSION_A=L\&quot;${{ steps.version.outputs.TAG }}\&quot; /DF4MENU_VER_MAJOR=${{ steps.version.outputs.MAJOR }} /DF4MENU_VER_MINOR=${{ steps.version.outputs.MINOR }} /DF4MENU_VER_PATCH=${{ steps.version.outputs.PATCH }} /DF4MENU_VER_BUILD=${{ steps.version.outputs.BUILD }} /DF4MENU_VERSION=L\&quot;${{ steps.version.outputs.TAG }}\&quot;"
+
+      - name: Build Win32
+        run: >
+          msbuild F4Menu.vcxproj /p:Configuration=Release /p:Platform=Win32 /v:minimal
+          /p:AdditionalOptions="/DF4MENU_VERSION_A=L\&quot;${{ steps.version.outputs.TAG }}\&quot; /DF4MENU_VER_MAJOR=${{ steps.version.outputs.MAJOR }} /DF4MENU_VER_MINOR=${{ steps.version.outputs.MINOR }} /DF4MENU_VER_PATCH=${{ steps.version.outputs.PATCH }} /DF4MENU_VER_BUILD=${{ steps.version.outputs.BUILD }} /DF4MENU_VERSION=L\&quot;${{ steps.version.outputs.TAG }}\&quot;"
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          name: ${{ steps.version.outputs.VERSION }}
-          files: |
-            F4Menu.exe
+          name: v${{ steps.version.outputs.TAG }}
+          files: F4Menu.exe
           generate_release_notes: true

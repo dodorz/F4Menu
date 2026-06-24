@@ -31,6 +31,10 @@
 #pragma comment(lib, "version.lib")
 
 // Constants
+#ifndef F4MENU_VERSION
+#define F4MENU_VERSION "1.0.0"
+#endif
+
 #define MAX_PROGRAMS 100
 #define MAX_PATH_LEN 1024
 #define MAX_PARAM_LEN 512
@@ -863,14 +867,21 @@ void DeleteSelectedPrograms(HWND hwnd) {
 
 // Show about dialog
 void ShowAboutDialog(HWND parent) {
-    MessageBoxW(parent, 
-        L"F4Menu v1.0\n\n"
-        L"Windows 文件启动器和配置工具\n\n"
+    WCHAR msg[512];
+    // Extract year from compile date (e.g. "Jun 24 2026" -> "2026")
+    const char* date = __DATE__;
+    const char* yearStr = date + strlen(date) - 4;
+    int year = atoi(yearStr);
+    
+    swprintf(msg, 512,
+        L"F4Menu v%S\n\n"
+        L"Windows 扩展名关联与文件打开工具\n\n"
         L"使用纯 Win32 API 开发\n"
         L"兼容 Windows XP 到 Windows 11\n\n"
-        L"© 2025",
-        L"关于 F4Menu",
-        MB_OK | MB_ICONINFORMATION);
+        L"© %d",
+        F4MENU_VERSION, year);
+    
+    MessageBoxW(parent, msg, L"关于 F4Menu", MB_OK | MB_ICONINFORMATION);
 }
 
 // Main window procedure
@@ -909,10 +920,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 btnX, btnY, btnWidth, btnHeight, hwnd, (HMENU)IDC_BTN_DELETE, g_hInst, NULL);
             btnX += btnSpacing;
             
-            CreateWindowW(L"BUTTON", L"保存", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                btnX, btnY, btnWidth, btnHeight, hwnd, (HMENU)IDC_BTN_SAVE, g_hInst, NULL);
-            btnX += btnSpacing;
-            
             CreateWindowW(L"BUTTON", L"关于", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
                 btnX, btnY, btnWidth, btnHeight, hwnd, (HMENU)IDC_BTN_ABOUT, g_hInst, NULL);
             btnX += btnSpacing;
@@ -942,8 +949,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SetWindowPos(GetDlgItem(hwnd, IDC_BTN_EDIT), NULL, btnX, btnY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
             btnX += btnSpacing;
             SetWindowPos(GetDlgItem(hwnd, IDC_BTN_DELETE), NULL, btnX, btnY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
-            btnX += btnSpacing;
-            SetWindowPos(GetDlgItem(hwnd, IDC_BTN_SAVE), NULL, btnX, btnY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
             btnX += btnSpacing;
             SetWindowPos(GetDlgItem(hwnd, IDC_BTN_ABOUT), NULL, btnX, btnY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
             btnX += btnSpacing;
@@ -1015,11 +1020,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 
                 case IDC_BTN_DELETE:
                     DeleteSelectedPrograms(hwnd);
-                    return 0;
-                
-                case IDC_BTN_SAVE:
-                    SavePrograms();
-                    MessageBoxW(hwnd, L"配置已保存！", L"提示", MB_OK | MB_ICONINFORMATION);
                     return 0;
                 
                 case IDC_BTN_ABOUT:
