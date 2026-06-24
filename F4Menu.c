@@ -1356,56 +1356,83 @@ void LaunchMode(int argc, WCHAR** argv) {
     } else if (selected >= 10000 && selected < 10000 + g_programCount) {
         ExecuteProgram(&g_programs[selected - 10000], files, fileCount);
     } else if (selected == 9001) {
-        // "其它程序..." - open edit dialog with first file's extension pre-filled
-        WCHAR ext[MAX_TYPE_LEN] = {0};
-        if (fileCount > 0) {
-            WCHAR* dot = wcsrchr(files[0], L'.');
-            if (dot) {
-                dot++;
-                wcscpy_s(ext, MAX_TYPE_LEN, dot);
+        // "其它程序..." - like main window "Add" button: select exe first, then show edit dialog
+        OPENFILENAMEW ofn = {0};
+        WCHAR exePath[MAX_PATH] = {0};
+        
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = NULL;
+        ofn.lpstrFilter = L"可执行文件 (*.exe)\0*.exe\0所有文件 (*.*)\0*.*\0";
+        ofn.lpstrFile = exePath;
+        ofn.nMaxFile = MAX_PATH;
+        ofn.lpstrTitle = L"选择要添加的程序";
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+        
+        if (GetOpenFileNameW(&ofn)) {
+            // Extract name: try PE version info for .exe, fallback to filename
+            WCHAR* lastDot = wcsrchr(exePath, L'.');
+            if (lastDot && _wcsicmp(lastDot, L".exe") == 0) {
+                WCHAR prodName[MAX_NAME_LEN] = {0};
+                if (GetExeProductName(exePath, prodName, MAX_NAME_LEN) && wcslen(prodName) > 0) {
+                    wcscpy_s(g_prefillName, MAX_NAME_LEN, prodName);
+                } else {
+                    WCHAR* lastSlash = wcsrchr(exePath, L'\\');
+                    WCHAR* name = lastSlash ? lastSlash + 1 : exePath;
+                    wcscpy_s(g_prefillName, MAX_NAME_LEN, name);
+                    WCHAR* dot = wcsrchr(g_prefillName, L'.');
+                    if (dot) *dot = L'\0';
+                }
+            } else {
+                WCHAR* lastSlash = wcsrchr(exePath, L'\\');
+                WCHAR* name = lastSlash ? lastSlash + 1 : exePath;
+                wcscpy_s(g_prefillName, MAX_NAME_LEN, name);
+                WCHAR* dot = wcsrchr(g_prefillName, L'.');
+                if (dot) *dot = L'\0';
             }
-        }
-        
-        // Pre-fill path = first file (for icon extraction)
-        wcscpy_s(g_prefillPath, MAX_PATH_LEN, files[0]);
-        
-        // Pre-fill name = filename without extension
-        WCHAR* lastSlash = wcsrchr(files[0], L'\\');
-        WCHAR* fName = lastSlash ? lastSlash + 1 : files[0];
-        wcscpy_s(g_prefillName, MAX_NAME_LEN, fName);
-        WCHAR* dot2 = wcsrchr(g_prefillName, L'.');
-        if (dot2) *dot2 = L'\0';
-        
-        g_prefillStart[0] = L'\0';
-        wcscpy_s(g_prefillType, MAX_TYPE_LEN, ext);
-        
-        // Show config window briefly to access edit dialog
-        LoadSettings();
-        
-        WNDCLASSEXW wc = {0};
-        wc.cbSize = sizeof(WNDCLASSEXW);
-        wc.lpfnWndProc = DefWindowProcW;
-        wc.hInstance = g_hInst;
-        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-        wc.lpszClassName = L"F4MenuConfigLaunch";
-        
-        if (RegisterClassExW(&wc)) {
-            HWND hwnd = CreateWindowExW(0, L"F4MenuConfigLaunch", L"F4Menu",
-                WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 1, 1,
-                NULL, NULL, g_hInst, NULL);
             
-            if (hwnd) {
-                ShowEditDialog(hwnd, -1);
-                DestroyWindow(hwnd);
-                UnregisterClassW(L"F4MenuConfigLaunch", g_hInst);
+            // Store full path for icon extraction
+            wcscpy_s(g_prefillPath, MAX_PATH_LEN, exePath);
+            g_prefillStart[0] = L'\0';
+            
+            // Pre-fill type with the file extension being opened
+            WCHAR ext[MAX_TYPE_LEN] = {0};
+            if (fileCount > 0) {
+                WCHAR* dot = wcsrchr(files[0], L'.');
+                if (dot) {
+                    dot++;
+                    wcscpy_s(ext, MAX_TYPE_LEN, dot);
+                }
             }
+            wcscpy_s(g_prefillType, MAX_TYPE_LEN, ext);
+            
+            // Create hidden host window for the edit dialog
+            LoadSettings();
+            
+            WNDCLASSEXW wc = {0};
+            wc.cbSize = sizeof(WNDCLASSEXW);
+            wc.lpfnWndProc = DefWindowProcW;
+            wc.hInstance = g_hInst;
+            wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+            wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+            wc.lpszClassName = L"F4MenuConfigLaunch";
+            
+            if (RegisterClassExW(&wc)) {
+                HWND hwnd = CreateWindowExW(0, L"F4MenuConfigLaunch", L"F4Menu",
+                    WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 1, 1,
+                    NULL, NULL, g_hInst, NULL);
+                
+                if (hwnd) {
+                    ShowEditDialog(hwnd, -1);
+                    DestroyWindow(hwnd);
+                    UnregisterClassW(L"F4MenuConfigLaunch", g_hInst);
+                }
+            }
+            
+            g_prefillPath[0] = L'\0';
+            g_prefillName[0] = L'\0';
+            g_prefillStart[0] = L'\0';
+            g_prefillType[0] = L'\0';
         }
-        
-        g_prefillPath[0] = L'\0';
-        g_prefillName[0] = L'\0';
-        g_prefillStart[0] = L'\0';
-        g_prefillType[0] = L'\0';
     }
 }
 
