@@ -827,22 +827,38 @@ void DeleteSelectedPrograms(HWND hwnd) {
         return;
     }
     
-    // Delete from end to beginning to maintain indices
-    int index = -1;
-    while ((index = (int)SendMessageW(g_hListView, LVM_GETNEXTITEM, index, LVNI_SELECTED)) != -1) {
-        // Mark for deletion by moving to end
-        if (index < g_programCount - 1) {
-            ProgramConfig temp = g_programs[index];
-            for (int i = index; i < g_programCount - 1; i++) {
-                g_programs[i] = g_programs[i + 1];
+    // Collect selected indices
+    int indices[MAX_PROGRAMS];
+    int count = 0;
+    int idx = -1;
+    while ((idx = (int)SendMessageW(g_hListView, LVM_GETNEXTITEM, idx, LVNI_SELECTED)) != -1) {
+        indices[count++] = idx;
+    }
+    
+    // Sort descending so we delete from end to beginning
+    for (int i = 0; i < count - 1; i++) {
+        for (int j = i + 1; j < count; j++) {
+            if (indices[i] < indices[j]) {
+                int tmp = indices[i];
+                indices[i] = indices[j];
+                indices[j] = tmp;
             }
-            g_programs[g_programCount - 1] = temp;
         }
-        g_programCount--;
-        index--; // Adjust for shift
+    }
+    
+    // Delete from highest index to lowest
+    for (int i = 0; i < count; i++) {
+        int delIdx = indices[i];
+        if (delIdx >= 0 && delIdx < g_programCount) {
+            for (int j = delIdx; j < g_programCount - 1; j++) {
+                g_programs[j] = g_programs[j + 1];
+            }
+            g_programCount--;
+        }
     }
     
     PopulateListView();
+    SavePrograms();
 }
 
 // Show about dialog
