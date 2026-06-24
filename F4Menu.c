@@ -1351,8 +1351,8 @@ void LaunchMode(int argc, WCHAR** argv) {
     }
     DestroyMenu(hMenu);
     
-    if (selected > 0 && selected <= matchCount) {
-        ExecuteProgram(&g_programs[matchedPrograms[selected - 1]], files, fileCount);
+    if (selected > 0 && selected <= g_programCount) {
+        ExecuteProgram(&g_programs[selected - 1], files, fileCount);
     } else if (selected >= 10000 && selected < 10000 + g_programCount) {
         ExecuteProgram(&g_programs[selected - 10000], files, fileCount);
     } else if (selected == 9001) {
