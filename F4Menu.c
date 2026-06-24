@@ -90,6 +90,7 @@ HFONT g_hFont = NULL;
 WCHAR g_prefillPath[MAX_PATH_LEN] = {0};
 WCHAR g_prefillName[MAX_NAME_LEN] = {0};
 WCHAR g_prefillStart[MAX_PATH_LEN] = {0};
+WCHAR g_prefillType[MAX_TYPE_LEN] = {0};
 int g_editIndex = -1;
 int g_selectedIconIndex = 0;
 
@@ -603,6 +604,7 @@ LRESULT CALLBACK EditDialogSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     g_prefillPath[0] = L'\0';
                     g_prefillName[0] = L'\0';
                     g_prefillStart[0] = L'\0';
+                    g_prefillType[0] = L'\0';
                     RemoveWindowSubclass(hwnd, EditDialogSubclassProc, subclassId);
                     DestroyWindow(hwnd);
                     return 0;
@@ -630,6 +632,7 @@ LRESULT CALLBACK EditDialogSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             g_prefillPath[0] = L'\0';
             g_prefillName[0] = L'\0';
             g_prefillStart[0] = L'\0';
+            g_prefillType[0] = L'\0';
             RemoveWindowSubclass(hwnd, EditDialogSubclassProc, subclassId);
             DestroyWindow(hwnd);
             return 0;
@@ -778,6 +781,9 @@ void ShowEditDialog(HWND parent, int index) {
         SetDlgItemTextW(hwnd, IDD_EDIT_START, g_prefillStart);
         SetDlgItemTextW(hwnd, IDD_EDIT_ICON_FILE, g_prefillPath);
         ExtractAndShowIcons(hwnd, g_prefillPath);
+        if (wcslen(g_prefillType) > 0) {
+            SetDlgItemTextW(hwnd, IDD_EDIT_TYPE, g_prefillType);
+        }
         SendDlgItemMessageW(hwnd, IDD_COMBO_MODE, CB_SETCURSEL, 0, 0);
         SendDlgItemMessageW(hwnd, IDD_COMBO_WINDOW, CB_SETCURSEL, 0, 0);
     } else {
@@ -976,6 +982,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         // Clear pre-fill data
                         g_prefillPath[0] = L'\0';
                         g_prefillName[0] = L'\0';
+                        g_prefillType[0] = L'\0';
                     }
                     return 0;
                 }
@@ -1231,6 +1238,7 @@ void LaunchMode(int argc, WCHAR** argv) {
     
     // Create popup menu
     HMENU hMenu = CreatePopupMenu();
+    HMENU hSubMenuAll = CreatePopupMenu();
     int menuIconSize = DPI_SCALE(16);
     
     for (int i = 0; i < matchCount; i++) {
@@ -1250,6 +1258,48 @@ void LaunchMode(int argc, WCHAR** argv) {
         
         InsertMenuItemW(hMenu, i, TRUE, &mii);
     }
+    
+    // Add separator
+    MENUITEMINFOW sep = {0};
+    sep.cbSize = sizeof(sep);
+    sep.fMask = MIIM_TYPE;
+    sep.fType = MFT_SEPARATOR;
+    InsertMenuItemW(hMenu, matchCount, TRUE, &sep);
+    
+    // "更多程序" submenu - list all programs
+    for (int i = 0; i < g_programCount; i++) {
+        MENUITEMINFOW mii = {0};
+        mii.cbSize = sizeof(mii);
+        mii.fMask = MIIM_STRING | MIIM_ID | MIIM_BITMAP;
+        mii.wID = 10000 + i;
+        mii.dwTypeData = g_programs[i].name;
+        
+        HICON hIcon = LoadIconFromPath(g_programs[i].icon);
+        if (hIcon) {
+            mii.hbmpItem = IconToBitmap(hIcon, menuIconSize);
+            DestroyIcon(hIcon);
+        }
+        
+        InsertMenuItemW(hSubMenuAll, i, TRUE, &mii);
+    }
+    
+    MENUITEMINFOW miiMore = {0};
+    miiMore.cbSize = sizeof(miiMore);
+    miiMore.fMask = MIIM_STRING | MIIM_SUBMENU;
+    miiMore.hSubMenu = hSubMenuAll;
+    miiMore.dwTypeData = L"更多程序";
+    InsertMenuItemW(hMenu, matchCount + 1, TRUE, &miiMore);
+    
+    // Add separator
+    InsertMenuItemW(hMenu, matchCount + 2, TRUE, &sep);
+    
+    // "其它程序..." item
+    MENUITEMINFOW miiOther = {0};
+    miiOther.cbSize = sizeof(miiOther);
+    miiOther.fMask = MIIM_STRING | MIIM_ID;
+    miiOther.wID = 9001;
+    miiOther.dwTypeData = L"其它程序...";
+    InsertMenuItemW(hMenu, matchCount + 3, TRUE, &miiOther);
     
     // Get cursor position
     POINT pt;
@@ -1284,10 +1334,71 @@ void LaunchMode(int argc, WCHAR** argv) {
             DeleteObject(mii.hbmpItem);
         }
     }
+    for (int i = 0; i < g_programCount; i++) {
+        MENUITEMINFOW mii = {0};
+        mii.cbSize = sizeof(mii);
+        mii.fMask = MIIM_BITMAP;
+        if (GetMenuItemInfoW(hSubMenuAll, 10000 + i, FALSE, &mii) && mii.hbmpItem) {
+            DeleteObject(mii.hbmpItem);
+        }
+    }
     DestroyMenu(hMenu);
     
-    if (selected > 0) {
-        ExecuteProgram(&g_programs[selected - 1], files, fileCount);
+    if (selected > 0 && selected <= matchCount) {
+        ExecuteProgram(&g_programs[matchedPrograms[selected - 1]], files, fileCount);
+    } else if (selected >= 10000 && selected < 10000 + g_programCount) {
+        ExecuteProgram(&g_programs[selected - 10000], files, fileCount);
+    } else if (selected == 9001) {
+        // "其它程序..." - open edit dialog with first file's extension pre-filled
+        WCHAR ext[MAX_TYPE_LEN] = {0};
+        if (fileCount > 0) {
+            WCHAR* dot = wcsrchr(files[0], L'.');
+            if (dot) {
+                dot++;
+                wcscpy_s(ext, MAX_TYPE_LEN, dot);
+            }
+        }
+        
+        // Pre-fill path = first file (for icon extraction)
+        wcscpy_s(g_prefillPath, MAX_PATH_LEN, files[0]);
+        
+        // Pre-fill name = filename without extension
+        WCHAR* lastSlash = wcsrchr(files[0], L'\\');
+        WCHAR* fName = lastSlash ? lastSlash + 1 : files[0];
+        wcscpy_s(g_prefillName, MAX_NAME_LEN, fName);
+        WCHAR* dot2 = wcsrchr(g_prefillName, L'.');
+        if (dot2) *dot2 = L'\0';
+        
+        g_prefillStart[0] = L'\0';
+        wcscpy_s(g_prefillType, MAX_TYPE_LEN, ext);
+        
+        // Show config window briefly to access edit dialog
+        LoadSettings();
+        
+        WNDCLASSEXW wc = {0};
+        wc.cbSize = sizeof(WNDCLASSEXW);
+        wc.lpfnWndProc = DefWindowProcW;
+        wc.hInstance = g_hInst;
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        wc.lpszClassName = L"F4MenuConfigLaunch";
+        
+        if (RegisterClassExW(&wc)) {
+            HWND hwnd = CreateWindowExW(0, L"F4MenuConfigLaunch", L"F4Menu",
+                WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 1, 1,
+                NULL, NULL, g_hInst, NULL);
+            
+            if (hwnd) {
+                ShowEditDialog(hwnd, -1);
+                DestroyWindow(hwnd);
+                UnregisterClassW(L"F4MenuConfigLaunch", g_hInst);
+            }
+        }
+        
+        g_prefillPath[0] = L'\0';
+        g_prefillName[0] = L'\0';
+        g_prefillStart[0] = L'\0';
+        g_prefillType[0] = L'\0';
     }
 }
 
