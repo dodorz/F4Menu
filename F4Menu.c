@@ -107,6 +107,9 @@ typedef struct {
 
 Settings g_settings = {0};
 
+// Custom INI path from command line
+WCHAR g_customIniPath[MAX_PATH] = {0};
+
 // Function declarations
 void GetIniFilePath(WCHAR* path, DWORD size);
 void LoadSettings();
@@ -128,8 +131,12 @@ HICON LoadIconFromPath(const WCHAR* iconPath);
 void ExpandEnvStrings(const WCHAR* src, WCHAR* dst, DWORD dstSize);
 BOOL GetExeProductName(const WCHAR* exePath, WCHAR* name, DWORD nameSize);
 
-// Get INI file path (same directory as executable)
+// Get INI file path
 void GetIniFilePath(WCHAR* path, DWORD size) {
+    if (wcslen(g_customIniPath) > 0) {
+        wcscpy_s(path, size, g_customIniPath);
+        return;
+    }
     GetModuleFileNameW(NULL, path, size);
     WCHAR* lastSlash = wcsrchr(path, L'\\');
     if (lastSlash) {
@@ -1497,14 +1504,26 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     int argc;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     
-    if (argc <= 1) {
+    // Scan for /ini parameter and collect file arguments
+    WCHAR* fileArgs[256];
+    int fileArgCount = 0;
+    
+    for (int i = 0; i < argc; i++) {
+        if (_wcsicmp(argv[i], L"/ini") == 0 && i + 1 < argc) {
+            wcscpy_s(g_customIniPath, MAX_PATH, argv[++i]);
+        } else if (argv[i][0] != L'/') {
+            fileArgs[fileArgCount++] = argv[i];
+        }
+    }
+    
+    if (fileArgCount == 0) {
         // Configuration mode
         int result = ConfigMode();
         LocalFree(argv);
         return result;
     } else {
         // Launch mode
-        LaunchMode(argc, argv);
+        LaunchMode(fileArgCount, fileArgs);
         LocalFree(argv);
         return 0;
     }
