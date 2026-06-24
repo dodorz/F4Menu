@@ -43,9 +43,14 @@ jobs:
       - name: Build Win32
         run: msbuild F4Menu.vcxproj /p:Configuration=Release /p:Platform=Win32 /v:minimal
 
+      - name: Package
+        shell: bash
+        run: |
+          7z a "F4Menu-${{ github.ref_name }}.zip" F4Menu.exe F4Menu.ini F4Menu.ico
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           name: v${{ github.ref_name }}
-          files: F4Menu.exe
+          files: F4Menu-${{ github.ref_name }}.zip
           generate_release_notes: true
