@@ -420,6 +420,32 @@ static void SetDialogFont(HWND hDlg, HFONT hFont) {
     EnumChildWindows(hDlg, SetFontEnumProc, (LPARAM)hFont);
 }
 
+// Convert HICON to HBITMAP for menu items
+static HBITMAP IconToBitmap(HICON hIcon, int size) {
+    if (!hIcon) return NULL;
+    
+    HDC hScreenDC = GetDC(NULL);
+    HDC hMemDC = CreateCompatibleDC(hScreenDC);
+    HBITMAP hBmp = CreateCompatibleBitmap(hScreenDC, size, size);
+    HBITMAP hOldBmp = (HBITMAP)SelectObject(hMemDC, hBmp);
+    
+    // Fill with white background
+    RECT rc = {0, 0, size, size};
+    HBRUSH hBr = (HBRUSH)GetStockObject(WHITE_BRUSH);
+    FillRect(hMemDC, &rc, hBr);
+    
+    // Draw icon centered
+    int x = (size - GetSystemMetrics(SM_CXSMICON)) / 2;
+    int y = (size - GetSystemMetrics(SM_CYSMICON)) / 2;
+    DrawIconEx(hMemDC, x, y, hIcon, 0, 0, 0, NULL, DI_NORMAL);
+    
+    SelectObject(hMemDC, hOldBmp);
+    DeleteDC(hMemDC);
+    ReleaseDC(NULL, hScreenDC);
+    
+    return hBmp;
+}
+
 // Extract icons from file and show in icon list view
 static void ExtractAndShowIcons(HWND hDlg, const WCHAR* filePath) {
     HWND hIconList = GetDlgItem(hDlg, IDD_ICON_LIST);
@@ -1205,6 +1231,7 @@ void LaunchMode(int argc, WCHAR** argv) {
     
     // Create popup menu
     HMENU hMenu = CreatePopupMenu();
+    int menuIconSize = DPI_SCALE(16);
     
     for (int i = 0; i < matchCount; i++) {
         int progIdx = matchedPrograms[i];
@@ -1215,10 +1242,9 @@ void LaunchMode(int argc, WCHAR** argv) {
         mii.wID = progIdx + 1;
         mii.dwTypeData = g_programs[progIdx].name;
         
-        // Load icon as bitmap (simplified - icons in menus require HBITMAP)
         HICON hIcon = LoadIconFromPath(g_programs[progIdx].icon);
         if (hIcon) {
-            // Note: Converting HICON to HBITMAP is complex, skipping for now
+            mii.hbmpItem = IconToBitmap(hIcon, menuIconSize);
             DestroyIcon(hIcon);
         }
         
@@ -1248,6 +1274,16 @@ void LaunchMode(int argc, WCHAR** argv) {
     
     DestroyWindow(hHost);
     UnregisterClassW(L"F4MenuPopupHost", g_hInst);
+    
+    // Free menu item bitmaps
+    for (int i = 0; i < matchCount; i++) {
+        MENUITEMINFOW mii = {0};
+        mii.cbSize = sizeof(mii);
+        mii.fMask = MIIM_BITMAP;
+        if (GetMenuItemInfoW(hMenu, matchedPrograms[i] + 1, FALSE, &mii) && mii.hbmpItem) {
+            DeleteObject(mii.hbmpItem);
+        }
+    }
     DestroyMenu(hMenu);
     
     if (selected > 0) {
