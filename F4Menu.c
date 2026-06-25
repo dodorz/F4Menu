@@ -110,6 +110,9 @@ Settings g_settings = {0};
 // Custom INI path from command line
 WCHAR g_customIniPath[MAX_PATH] = {0};
 
+// Runtime data file path (.dat)
+WCHAR g_datPath[MAX_PATH] = {0};
+
 // Function declarations
 void GetIniFilePath(WCHAR* path, DWORD size);
 void LoadSettings();
@@ -143,6 +146,23 @@ void GetIniFilePath(WCHAR* path, DWORD size) {
         *(lastSlash + 1) = L'\0';
     }
     wcscat_s(path, size, L"F4Menu.ini");
+}
+
+// Get .dat file path (same location as INI)
+void GetDatFilePath(WCHAR* path, DWORD size) {
+    if (wcslen(g_customIniPath) > 0) {
+        wcscpy_s(path, size, g_customIniPath);
+        WCHAR* dot = wcsrchr(path, L'.');
+        if (dot) wcscpy_s(dot, size - (dot - path), L".dat");
+        else wcscat_s(path, size, L".dat");
+        return;
+    }
+    GetModuleFileNameW(NULL, path, size);
+    WCHAR* lastSlash = wcsrchr(path, L'\\');
+    if (lastSlash) {
+        *(lastSlash + 1) = L'\0';
+    }
+    wcscat_s(path, size, L"F4Menu.dat");
 }
 
 // Expand environment variables
@@ -187,12 +207,12 @@ BOOL GetExeProductName(const WCHAR* exePath, WCHAR* name, DWORD nameSize) {
     return FALSE;
 }
 
-// Load settings from INI
+// Load settings from .dat file
 void LoadSettings() {
-    GetIniFilePath(g_iniPath, MAX_PATH);
+    GetDatFilePath(g_datPath, MAX_PATH);
     
-    DWORD winPos = GetPrivateProfileIntW(L"Settings", L"WinPos", 15598003, g_iniPath);
-    DWORD winSize = GetPrivateProfileIntW(L"Settings", L"WinSize", 25428634, g_iniPath);
+    DWORD winPos = GetPrivateProfileIntW(L"Settings", L"WinPos", 15598003, g_datPath);
+    DWORD winSize = GetPrivateProfileIntW(L"Settings", L"WinSize", 25428634, g_datPath);
     
     g_settings.winPosX = LOWORD(winPos);
     g_settings.winPosY = HIWORD(winPos);
@@ -205,8 +225,8 @@ void LoadSettings() {
     
     // Load column widths
     WCHAR columnStr[512] = {0};
-    GetPrivateProfileStringW(L"Settings", L"Column", L"164,310,67,234,63,38,50,76,157,", 
-                             columnStr, 512, g_iniPath);
+    GetPrivateProfileStringW(L"Settings", L"Column", L"24,150,200,100,150,60,60,60,150,", 
+                             columnStr, 512, g_datPath);
     
     int idx = 0;
     WCHAR* context = NULL;
@@ -225,7 +245,7 @@ void LoadSettings() {
     }
 }
 
-// Save settings to INI
+// Save settings to .dat file
 void SaveSettings() {
     WCHAR buffer[64];
     
@@ -233,10 +253,10 @@ void SaveSettings() {
     DWORD winSize = MAKELONG(g_settings.winWidth, g_settings.winHeight);
     
     swprintf(buffer, 64, L"%u", winPos);
-    WritePrivateProfileStringW(L"Settings", L"WinPos", buffer, g_iniPath);
+    WritePrivateProfileStringW(L"Settings", L"WinPos", buffer, g_datPath);
     
     swprintf(buffer, 64, L"%u", winSize);
-    WritePrivateProfileStringW(L"Settings", L"WinSize", buffer, g_iniPath);
+    WritePrivateProfileStringW(L"Settings", L"WinSize", buffer, g_datPath);
     
     // Save column widths
     WCHAR columnStr[512] = {0};
@@ -248,7 +268,7 @@ void SaveSettings() {
             wcscat_s(columnStr, 512, temp);
         }
     }
-    WritePrivateProfileStringW(L"Settings", L"Column", columnStr, g_iniPath);
+    WritePrivateProfileStringW(L"Settings", L"Column", columnStr, g_datPath);
 }
 
 // Load programs from INI
@@ -1159,9 +1179,11 @@ BOOL MatchExtension(const WCHAR* fileExt, const WCHAR* typeList) {
 void ExecuteProgram(ProgramConfig* prog, WCHAR** files, int fileCount) {
     WCHAR expandedPath[MAX_PATH_LEN];
     WCHAR expandedStart[MAX_PATH_LEN];
+    WCHAR expandedParam[MAX_PARAM_LEN];
     
     ExpandEnvStrings(prog->path, expandedPath, MAX_PATH_LEN);
     ExpandEnvStrings(prog->start, expandedStart, MAX_PATH_LEN);
+    ExpandEnvStrings(prog->param, expandedParam, MAX_PARAM_LEN);
     
     // Determine window state
     int nShowCmd = SW_SHOWNORMAL;
@@ -1173,7 +1195,7 @@ void ExecuteProgram(ProgramConfig* prog, WCHAR** files, int fileCount) {
         for (int i = 0; i < fileCount; i++) {
             WCHAR cmdLine[MAX_PATH_LEN * 2];
             swprintf(cmdLine, MAX_PATH_LEN * 2, L"\"%s\" %s \"%s\"", 
-                expandedPath, prog->param, files[i]);
+                expandedPath, expandedParam, files[i]);
             
             SHELLEXECUTEINFOW sei = {0};
             sei.cbSize = sizeof(sei);
@@ -1192,7 +1214,7 @@ void ExecuteProgram(ProgramConfig* prog, WCHAR** files, int fileCount) {
     } else {
         // Merged mode - launch once with all files
         WCHAR cmdLine[MAX_PATH_LEN * 4] = {0};
-        swprintf(cmdLine, MAX_PATH_LEN * 4, L"\"%s\" %s", expandedPath, prog->param);
+        swprintf(cmdLine, MAX_PATH_LEN * 4, L"\"%s\" %s", expandedPath, expandedParam);
         
         for (int i = 0; i < fileCount; i++) {
             wcscat_s(cmdLine, MAX_PATH_LEN * 4, L" \"");
