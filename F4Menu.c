@@ -46,6 +46,8 @@
 #define IDC_BTN_SAVE 1005
 #define IDC_BTN_ABOUT 1006
 #define IDC_BTN_EXIT 1007
+#define IDC_BTN_UP 1008
+#define IDC_BTN_DOWN 1009
 
 #define IDD_EDIT_NAME 2001
 #define IDD_EDIT_PATH 2002
@@ -96,6 +98,12 @@ WCHAR g_prefillType[MAX_TYPE_LEN] = {0};
 int g_editIndex = -1;
 int g_selectedIconIndex = 0;
 
+// ListView drag-and-drop reordering state
+BOOL g_dragging = FALSE;
+int g_dragIndex = -1;
+int g_dragTarget = -1;
+HIMAGELIST g_dragImageList = NULL;
+
 // Settings
 typedef struct {
     int winPosX;
@@ -133,6 +141,7 @@ void ExecuteProgram(ProgramConfig* prog, WCHAR** files, int fileCount);
 HICON LoadIconFromPath(const WCHAR* iconPath);
 void ExpandEnvStrings(const WCHAR* src, WCHAR* dst, DWORD dstSize);
 BOOL GetExeProductName(const WCHAR* exePath, WCHAR* name, DWORD nameSize);
+void AddProgramFromFilePath(HWND hwnd, const WCHAR* exePath);
 
 // Get INI file path
 void GetIniFilePath(WCHAR* path, DWORD size) {
@@ -168,6 +177,149 @@ void GetDatFilePath(WCHAR* path, DWORD size) {
 // Expand environment variables
 void ExpandEnvStrings(const WCHAR* src, WCHAR* dst, DWORD dstSize) {
     ExpandEnvironmentStringsW(src, dst, dstSize);
+}
+
+// INI file parser - single read, in-memory parse (replaces per-field GetPrivateProfile API calls)
+#define INI_MAX_ENTRIES 1024
+
+typedef struct {
+    WCHAR section[64];
+    WCHAR* key;
+    WCHAR* value;
+} IniEntry;
+
+typedef struct {
+    WCHAR* buffer;
+    IniEntry entries[INI_MAX_ENTRIES];
+    int count;
+} IniFile;
+
+static void IniFree(IniFile* ini) {
+    if (ini->buffer) {
+        HeapFree(GetProcessHeap(), 0, ini->buffer);
+        ini->buffer = NULL;
+    }
+    ini->count = 0;
+}
+
+static void IniParseBuffer(IniFile* ini) {
+    ini->count = 0;
+
+    WCHAR curSection[64] = {0};
+    WCHAR* context = NULL;
+    WCHAR* line = wcstok_s(ini->buffer, L"\r\n", &context);
+
+    while (line && ini->count < INI_MAX_ENTRIES) {
+        while (*line == L' ' || *line == L'\t') line++;
+        if (*line == L'\0') { line = wcstok_s(NULL, L"\r\n", &context); continue; }
+
+        if (*line == L'[') {
+            WCHAR* end = wcschr(line, L']');
+            if (end) {
+                *end = L'\0';
+                wcscpy_s(curSection, 64, line + 1);
+            }
+            line = wcstok_s(NULL, L"\r\n", &context);
+            continue;
+        }
+
+        if (*line == L';' || *line == L'#') {
+            line = wcstok_s(NULL, L"\r\n", &context);
+            continue;
+        }
+
+        WCHAR* eq = wcschr(line, L'=');
+        if (eq) {
+            *eq = L'\0';
+            WCHAR* key = line;
+            WCHAR* value = eq + 1;
+
+            size_t klen = wcslen(key);
+            while (klen > 0 && (key[klen - 1] == L' ' || key[klen - 1] == L'\t'))
+                key[--klen] = L'\0';
+
+            wcscpy_s(ini->entries[ini->count].section, 64, curSection);
+            ini->entries[ini->count].key = key;
+            ini->entries[ini->count].value = value;
+            ini->count++;
+        }
+
+        line = wcstok_s(NULL, L"\r\n", &context);
+    }
+}
+
+static BOOL IniLoad(IniFile* ini, const WCHAR* path) {
+    HANDLE hFile = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ,
+                               NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return FALSE;
+
+    DWORD fileSize = GetFileSize(hFile, NULL);
+    if (fileSize == INVALID_FILE_SIZE || fileSize == 0) {
+        CloseHandle(hFile);
+        return FALSE;
+    }
+
+    BYTE* rawBytes = (BYTE*)HeapAlloc(GetProcessHeap(), 0, fileSize);
+    if (!rawBytes) {
+        CloseHandle(hFile);
+        return FALSE;
+    }
+
+    DWORD bytesRead = 0;
+    BOOL ok = ReadFile(hFile, rawBytes, fileSize, &bytesRead, NULL);
+    CloseHandle(hFile);
+    if (!ok) { HeapFree(GetProcessHeap(), 0, rawBytes); return FALSE; }
+
+    const BYTE* src = rawBytes;
+    UINT srcLen = bytesRead;
+    int skipBom = 0;
+
+    if (bytesRead >= 3 && rawBytes[0] == 0xEF && rawBytes[1] == 0xBB && rawBytes[2] == 0xBF) {
+        skipBom = 3;
+    } else if (bytesRead >= 2 && rawBytes[0] == 0xFF && rawBytes[1] == 0xFE) {
+        src += 2;
+        srcLen -= 2;
+        int wideLen = srcLen / sizeof(WCHAR);
+        ini->buffer = (WCHAR*)HeapAlloc(GetProcessHeap(), 0, (wideLen + 1) * sizeof(WCHAR));
+        if (!ini->buffer) { HeapFree(GetProcessHeap(), 0, rawBytes); return FALSE; }
+        CopyMemory(ini->buffer, src, wideLen * sizeof(WCHAR));
+        ini->buffer[wideLen] = L'\0';
+        HeapFree(GetProcessHeap(), 0, rawBytes);
+        IniParseBuffer(ini);
+        return TRUE;
+    }
+
+    src += skipBom;
+    srcLen -= skipBom;
+
+    int wideLen = MultiByteToWideChar(CP_UTF8, 0, (const char*)src, srcLen, NULL, 0);
+    if (wideLen <= 0) { HeapFree(GetProcessHeap(), 0, rawBytes); return FALSE; }
+
+    ini->buffer = (WCHAR*)HeapAlloc(GetProcessHeap(), 0, (wideLen + 1) * sizeof(WCHAR));
+    if (!ini->buffer) { HeapFree(GetProcessHeap(), 0, rawBytes); return FALSE; }
+
+    MultiByteToWideChar(CP_UTF8, 0, (const char*)src, srcLen, ini->buffer, wideLen);
+    ini->buffer[wideLen] = L'\0';
+
+    HeapFree(GetProcessHeap(), 0, rawBytes);
+
+    IniParseBuffer(ini);
+    return TRUE;
+}
+
+static WCHAR* IniGet(IniFile* ini, const WCHAR* section, const WCHAR* key) {
+    for (int i = 0; i < ini->count; i++) {
+        if (_wcsicmp(ini->entries[i].section, section) == 0 &&
+            _wcsicmp(ini->entries[i].key, key) == 0) {
+            return ini->entries[i].value;
+        }
+    }
+    return NULL;
+}
+
+static int IniGetInt(IniFile* ini, const WCHAR* section, const WCHAR* key, int def) {
+    WCHAR* val = IniGet(ini, section, key);
+    return val ? _wtoi(val) : def;
 }
 
 // Extract product name from PE version info
@@ -271,28 +423,34 @@ void SaveSettings() {
     WritePrivateProfileStringW(L"Settings", L"Column", columnStr, g_datPath);
 }
 
-// Load programs from INI
+// Load programs from INI (single-read in-memory parser)
 void LoadPrograms() {
     GetIniFilePath(g_iniPath, MAX_PATH);
-    
-    g_programCount = GetPrivateProfileIntW(L"General", L"Count", 0, g_iniPath);
+
+    IniFile ini = {0};
+    if (!IniLoad(&ini, g_iniPath)) return;
+
+    g_programCount = IniGetInt(&ini, L"General", L"Count", 0);
     if (g_programCount > MAX_PROGRAMS) g_programCount = MAX_PROGRAMS;
-    
+
     for (int i = 0; i < g_programCount; i++) {
         WCHAR section[32];
         swprintf(section, 32, L"Program%d", i);
-        
-        GetPrivateProfileStringW(section, L"Name", L"", g_programs[i].name, MAX_NAME_LEN, g_iniPath);
-        GetPrivateProfileStringW(section, L"Path", L"", g_programs[i].path, MAX_PATH_LEN, g_iniPath);
-        GetPrivateProfileStringW(section, L"Param", L"", g_programs[i].param, MAX_PARAM_LEN, g_iniPath);
-        GetPrivateProfileStringW(section, L"Start", L"", g_programs[i].start, MAX_PATH_LEN, g_iniPath);
-        GetPrivateProfileStringW(section, L"Icon", L"", g_programs[i].icon, MAX_PATH_LEN, g_iniPath);
-        GetPrivateProfileStringW(section, L"Type", L"", g_programs[i].type, MAX_TYPE_LEN, g_iniPath);
-        
-        g_programs[i].mode = GetPrivateProfileIntW(section, L"Mode", 0, g_iniPath);
-        g_programs[i].window = GetPrivateProfileIntW(section, L"Window", 0, g_iniPath);
-        g_programs[i].main = GetPrivateProfileIntW(section, L"Main", 0, g_iniPath);
+
+        WCHAR* val;
+        val = IniGet(&ini, section, L"Name");   if (val) wcscpy_s(g_programs[i].name, MAX_NAME_LEN, val);
+        val = IniGet(&ini, section, L"Path");   if (val) wcscpy_s(g_programs[i].path, MAX_PATH_LEN, val);
+        val = IniGet(&ini, section, L"Param");  if (val) wcscpy_s(g_programs[i].param, MAX_PARAM_LEN, val);
+        val = IniGet(&ini, section, L"Start");  if (val) wcscpy_s(g_programs[i].start, MAX_PATH_LEN, val);
+        val = IniGet(&ini, section, L"Icon");   if (val) wcscpy_s(g_programs[i].icon, MAX_PATH_LEN, val);
+        val = IniGet(&ini, section, L"Type");   if (val) wcscpy_s(g_programs[i].type, MAX_TYPE_LEN, val);
+
+        g_programs[i].mode = IniGetInt(&ini, section, L"Mode", 0);
+        g_programs[i].window = IniGetInt(&ini, section, L"Window", 0);
+        g_programs[i].main = IniGetInt(&ini, section, L"Main", 0);
     }
+
+    IniFree(&ini);
 }
 
 // Save programs to INI
@@ -909,6 +1067,39 @@ void ShowAboutDialog(HWND parent) {
     MessageBoxW(parent, msg, L"关于 F4Menu", MB_OK | MB_ICONINFORMATION);
 }
 
+// Add program from exe file path (used by button and drag-and-drop)
+void AddProgramFromFilePath(HWND hwnd, const WCHAR* exePath) {
+    WCHAR* lastDot = wcsrchr(exePath, L'.');
+    if (lastDot && _wcsicmp(lastDot, L".exe") == 0) {
+        WCHAR prodName[MAX_NAME_LEN] = {0};
+        if (GetExeProductName(exePath, prodName, MAX_NAME_LEN) && wcslen(prodName) > 0) {
+            wcscpy_s(g_prefillName, MAX_NAME_LEN, prodName);
+        } else {
+            WCHAR* lastSlash = wcsrchr(exePath, L'\\');
+            WCHAR* name = lastSlash ? lastSlash + 1 : exePath;
+            wcscpy_s(g_prefillName, MAX_NAME_LEN, name);
+            WCHAR* dot = wcsrchr(g_prefillName, L'.');
+            if (dot) *dot = L'\0';
+        }
+    } else {
+        WCHAR* lastSlash = wcsrchr(exePath, L'\\');
+        WCHAR* name = lastSlash ? lastSlash + 1 : exePath;
+        wcscpy_s(g_prefillName, MAX_NAME_LEN, name);
+        WCHAR* dot = wcsrchr(g_prefillName, L'.');
+        if (dot) *dot = L'\0';
+    }
+
+    wcscpy_s(g_prefillPath, MAX_PATH_LEN, exePath);
+    g_prefillStart[0] = L'\0';
+    g_prefillType[0] = L'\0';
+
+    ShowEditDialog(hwnd, -1);
+
+    g_prefillPath[0] = L'\0';
+    g_prefillName[0] = L'\0';
+    g_prefillType[0] = L'\0';
+}
+
 // Main window procedure
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
@@ -929,9 +1120,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // Create buttons
             int btnY = DPI_SCALE(500);
             int btnX = DPI_SCALE(10);
-            int btnWidth = DPI_SCALE(80);
+            int btnWidth = DPI_SCALE(65);
             int btnHeight = DPI_SCALE(30);
-            int btnSpacing = DPI_SCALE(90);
+            int btnSpacing = DPI_SCALE(75);
             
             CreateWindowW(L"BUTTON", L"添加", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
                 btnX, btnY, btnWidth, btnHeight, hwnd, (HMENU)IDC_BTN_ADD, g_hInst, NULL);
@@ -945,6 +1136,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 btnX, btnY, btnWidth, btnHeight, hwnd, (HMENU)IDC_BTN_DELETE, g_hInst, NULL);
             btnX += btnSpacing;
             
+            CreateWindowW(L"BUTTON", L"上移", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                btnX, btnY, btnWidth, btnHeight, hwnd, (HMENU)IDC_BTN_UP, g_hInst, NULL);
+            btnX += btnSpacing;
+            
+            CreateWindowW(L"BUTTON", L"下移", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                btnX, btnY, btnWidth, btnHeight, hwnd, (HMENU)IDC_BTN_DOWN, g_hInst, NULL);
+            btnX += btnSpacing;
+            
             CreateWindowW(L"BUTTON", L"关于", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
                 btnX, btnY, btnWidth, btnHeight, hwnd, (HMENU)IDC_BTN_ABOUT, g_hInst, NULL);
             btnX += btnSpacing;
@@ -953,6 +1152,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 btnX, btnY, btnWidth, btnHeight, hwnd, (HMENU)IDC_BTN_EXIT, g_hInst, NULL);
             
             SetDialogFont(hwnd, g_hFont);
+            
+            DragAcceptFiles(hwnd, TRUE);
             
             return 0;
         }
@@ -967,13 +1168,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // Reposition buttons
             int btnY = height - DPI_SCALE(40);
             int btnX = DPI_SCALE(10);
-            int btnSpacing = DPI_SCALE(90);
+            int btnSpacing = DPI_SCALE(75);
             
             SetWindowPos(GetDlgItem(hwnd, IDC_BTN_ADD), NULL, btnX, btnY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
             btnX += btnSpacing;
             SetWindowPos(GetDlgItem(hwnd, IDC_BTN_EDIT), NULL, btnX, btnY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
             btnX += btnSpacing;
             SetWindowPos(GetDlgItem(hwnd, IDC_BTN_DELETE), NULL, btnX, btnY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+            btnX += btnSpacing;
+            SetWindowPos(GetDlgItem(hwnd, IDC_BTN_UP), NULL, btnX, btnY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+            btnX += btnSpacing;
+            SetWindowPos(GetDlgItem(hwnd, IDC_BTN_DOWN), NULL, btnX, btnY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
             btnX += btnSpacing;
             SetWindowPos(GetDlgItem(hwnd, IDC_BTN_ABOUT), NULL, btnX, btnY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
             btnX += btnSpacing;
@@ -985,7 +1190,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_COMMAND: {
             switch (LOWORD(wParam)) {
                 case IDC_BTN_ADD: {
-                    // Show file open dialog first
                     OPENFILENAMEW ofn = {0};
                     WCHAR fileName[MAX_PATH] = {0};
                     
@@ -998,37 +1202,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
                     
                     if (GetOpenFileNameW(&ofn)) {
-                        // Extract name: try PE version info for .exe, fallback to filename
-                        WCHAR* lastDot = wcsrchr(fileName, L'.');
-                        if (lastDot && _wcsicmp(lastDot, L".exe") == 0) {
-                            WCHAR prodName[MAX_NAME_LEN] = {0};
-                            if (GetExeProductName(fileName, prodName, MAX_NAME_LEN) && wcslen(prodName) > 0) {
-                                wcscpy_s(g_prefillName, MAX_NAME_LEN, prodName);
-                            } else {
-                                // Fallback to filename without extension
-                                WCHAR* lastSlash = wcsrchr(fileName, L'\\');
-                                WCHAR* name = lastSlash ? lastSlash + 1 : fileName;
-                                wcscpy_s(g_prefillName, MAX_NAME_LEN, name);
-                                WCHAR* dot = wcsrchr(g_prefillName, L'.');
-                                if (dot) *dot = L'\0';
-                            }
-                        } else {
-                            WCHAR* lastSlash = wcsrchr(fileName, L'\\');
-                            WCHAR* name = lastSlash ? lastSlash + 1 : fileName;
-                            wcscpy_s(g_prefillName, MAX_NAME_LEN, name);
-                            WCHAR* dot = wcsrchr(g_prefillName, L'.');
-                            if (dot) *dot = L'\0';
-                        }
-                        
-                        // Store full path
-                        wcscpy_s(g_prefillPath, MAX_PATH_LEN, fileName);
-                        
-                        ShowEditDialog(hwnd, -1);
-                        
-                        // Clear pre-fill data
-                        g_prefillPath[0] = L'\0';
-                        g_prefillName[0] = L'\0';
-                        g_prefillType[0] = L'\0';
+                        AddProgramFromFilePath(hwnd, fileName);
                     }
                     return 0;
                 }
@@ -1047,6 +1221,30 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     DeleteSelectedPrograms(hwnd);
                     return 0;
                 
+                case IDC_BTN_UP: {
+                    int sel = (int)SendMessageW(g_hListView, LVM_GETNEXTITEM, -1, LVNI_SELECTED);
+                    if (sel <= 0) return 0;
+                    ProgramConfig tmp = g_programs[sel];
+                    g_programs[sel] = g_programs[sel - 1];
+                    g_programs[sel - 1] = tmp;
+                    PopulateListView();
+                    SavePrograms();
+                    ListView_SetItemState(g_hListView, sel - 1, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+                    return 0;
+                }
+                
+                case IDC_BTN_DOWN: {
+                    int sel = (int)SendMessageW(g_hListView, LVM_GETNEXTITEM, -1, LVNI_SELECTED);
+                    if (sel < 0 || sel >= g_programCount - 1) return 0;
+                    ProgramConfig tmp = g_programs[sel];
+                    g_programs[sel] = g_programs[sel + 1];
+                    g_programs[sel + 1] = tmp;
+                    PopulateListView();
+                    SavePrograms();
+                    ListView_SetItemState(g_hListView, sel + 1, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+                    return 0;
+                }
+                
                 case IDC_BTN_ABOUT:
                     ShowAboutDialog(hwnd);
                     return 0;
@@ -1060,12 +1258,98 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         
         case WM_NOTIFY: {
             LPNMHDR nmhdr = (LPNMHDR)lParam;
-            if (nmhdr->idFrom == IDC_LISTVIEW && nmhdr->code == NM_DBLCLK) {
-                int selected = (int)SendMessageW(g_hListView, LVM_GETNEXTITEM, -1, LVNI_SELECTED);
-                if (selected >= 0) {
-                    ShowEditDialog(hwnd, selected);
+            if (nmhdr->idFrom == IDC_LISTVIEW) {
+                if (nmhdr->code == NM_DBLCLK) {
+                    int selected = (int)SendMessageW(g_hListView, LVM_GETNEXTITEM, -1, LVNI_SELECTED);
+                    if (selected >= 0) {
+                        ShowEditDialog(hwnd, selected);
+                    }
+                } else if (nmhdr->code == LVN_BEGINDRAG) {
+                    LPNMLISTVIEW nmlv = (LPNMLISTVIEW)lParam;
+                    g_dragging = TRUE;
+                    g_dragIndex = nmlv->iItem;
+                    g_dragTarget = -1;
+
+                    g_dragImageList = (HIMAGELIST)SendMessageW(g_hListView, LVM_CREATEDRAGIMAGE, nmlv->iItem, 0);
+                    POINT pt = {nmlv->ptAction.x, nmlv->ptAction.y};
+                    ClientToScreen(g_hListView, &pt);
+                    ImageList_DragEnter(GetDesktopWindow(), pt.x, pt.y);
+                    ImageList_DragShowNolock(TRUE);
+                    SetCapture(hwnd);
                 }
             }
+            return 0;
+        }
+        
+        case WM_MOUSEMOVE: {
+            if (g_dragging) {
+                int x = GET_X_LPARAM(lParam);
+                int y = GET_Y_LPARAM(lParam);
+                ImageList_DragMove(x, y);
+
+                POINT pt = {x, y};
+                MapWindowPoints(hwnd, g_hListView, &pt, 1);
+
+                int prevTarget = g_dragTarget;
+                LVHITTESTINFO hit = {0};
+                hit.pt = pt;
+                g_dragTarget = (int)SendMessageW(g_hListView, LVM_HITTEST, 0, (LPARAM)&hit);
+
+                if (g_dragTarget != prevTarget) {
+                    if (prevTarget >= 0)
+                        ListView_SetItemState(g_hListView, prevTarget, 0, LVIS_CUT);
+                    if (g_dragTarget >= 0 && g_dragTarget != g_dragIndex)
+                        ListView_SetItemState(g_hListView, g_dragTarget, LVIS_CUT, LVIS_CUT);
+                }
+            }
+            return 0;
+        }
+        
+        case WM_LBUTTONUP: {
+            if (g_dragging) {
+                g_dragging = FALSE;
+                ImageList_DragLeave(GetDesktopWindow());
+                ImageList_DragShowNolock(FALSE);
+                if (g_dragImageList) {
+                    ImageList_Destroy(g_dragImageList);
+                    g_dragImageList = NULL;
+                }
+                ReleaseCapture();
+
+                if (g_dragTarget >= 0 && g_dragTarget != g_dragIndex && g_dragTarget < g_programCount) {
+                    ProgramConfig tmp = g_programs[g_dragIndex];
+                    if (g_dragIndex < g_dragTarget) {
+                        for (int i = g_dragIndex; i < g_dragTarget; i++)
+                            g_programs[i] = g_programs[i + 1];
+                    } else {
+                        for (int i = g_dragIndex; i > g_dragTarget; i--)
+                            g_programs[i] = g_programs[i - 1];
+                    }
+                    g_programs[g_dragTarget] = tmp;
+
+                    PopulateListView();
+                    SavePrograms();
+                    ListView_SetItemState(g_hListView, g_dragTarget, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+                } else if (g_dragTarget >= 0) {
+                    ListView_SetItemState(g_hListView, g_dragTarget, 0, LVIS_CUT);
+                }
+                g_dragTarget = -1;
+            }
+            return 0;
+        }
+        
+        case WM_DROPFILES: {
+            HDROP hDrop = (HDROP)wParam;
+            UINT count = DragQueryFileW(hDrop, 0xFFFFFFFF, NULL, 0);
+            for (UINT i = 0; i < count; i++) {
+                WCHAR filePath[MAX_PATH];
+                DragQueryFileW(hDrop, i, filePath, MAX_PATH);
+                WCHAR* ext = wcsrchr(filePath, L'.');
+                if (ext && _wcsicmp(ext, L".exe") == 0) {
+                    AddProgramFromFilePath(hwnd, filePath);
+                }
+            }
+            DragFinish(hDrop);
             return 0;
         }
         
@@ -1238,6 +1522,44 @@ void ExecuteProgram(ProgramConfig* prog, WCHAR** files, int fileCount) {
     }
 }
 
+// Icon bitmap cache for LaunchMode menu (avoids duplicate ExtractIconExW calls)
+#define ICON_CACHE_SIZE 256
+
+typedef struct {
+    WCHAR path[MAX_PATH_LEN];
+    HBITMAP hBitmap;
+} IconCacheEntry;
+
+static IconCacheEntry g_iconCache[ICON_CACHE_SIZE];
+static int g_iconCacheCount = 0;
+
+static HBITMAP GetCachedIconBitmap(const WCHAR* iconPath, int size) {
+    for (int i = 0; i < g_iconCacheCount; i++) {
+        if (_wcsicmp(g_iconCache[i].path, iconPath) == 0)
+            return g_iconCache[i].hBitmap;
+    }
+
+    HICON hIcon = LoadIconFromPath(iconPath);
+    HBITMAP hBitmap = IconToBitmap(hIcon, size);
+    if (hIcon) DestroyIcon(hIcon);
+
+    if (g_iconCacheCount < ICON_CACHE_SIZE) {
+        wcscpy_s(g_iconCache[g_iconCacheCount].path, MAX_PATH_LEN, iconPath);
+        g_iconCache[g_iconCacheCount].hBitmap = hBitmap;
+        g_iconCacheCount++;
+    }
+
+    return hBitmap;
+}
+
+static void FreeIconCache() {
+    for (int i = 0; i < g_iconCacheCount; i++) {
+        if (g_iconCache[i].hBitmap) DeleteObject(g_iconCache[i].hBitmap);
+        g_iconCache[i].path[0] = L'\0';
+    }
+    g_iconCacheCount = 0;
+}
+
 // Launch mode
 void LaunchMode(int argc, WCHAR** argv) {
     LoadPrograms();
@@ -1293,10 +1615,13 @@ void LaunchMode(int argc, WCHAR** argv) {
         mii.wID = progIdx + 1;
         mii.dwTypeData = g_programs[progIdx].name;
         
-        HICON hIcon = LoadIconFromPath(g_programs[progIdx].icon);
-        if (hIcon) {
-            mii.hbmpItem = IconToBitmap(hIcon, menuIconSize);
-            DestroyIcon(hIcon);
+        mii.hbmpItem = GetCachedIconBitmap(g_programs[progIdx].icon, menuIconSize);
+        
+        WCHAR expandedPath[MAX_PATH_LEN];
+        ExpandEnvStrings(g_programs[progIdx].path, expandedPath, MAX_PATH_LEN);
+        if (GetFileAttributesW(expandedPath) == INVALID_FILE_ATTRIBUTES) {
+            mii.fMask |= MIIM_STATE;
+            mii.fState = MFS_DISABLED | MFS_GRAYED;
         }
         
         InsertMenuItemW(hMenu, i, TRUE, &mii);
@@ -1317,18 +1642,13 @@ void LaunchMode(int argc, WCHAR** argv) {
         mii.wID = 10000 + i;
         mii.dwTypeData = g_programs[i].name;
         
-        // Check if program path exists
         WCHAR expandedPath[MAX_PATH_LEN];
         ExpandEnvStrings(g_programs[i].path, expandedPath, MAX_PATH_LEN);
         if (GetFileAttributesW(expandedPath) == INVALID_FILE_ATTRIBUTES) {
             mii.fState = MFS_DISABLED | MFS_GRAYED;
         }
         
-        HICON hIcon = LoadIconFromPath(g_programs[i].icon);
-        if (hIcon) {
-            mii.hbmpItem = IconToBitmap(hIcon, menuIconSize);
-            DestroyIcon(hIcon);
-        }
+        mii.hbmpItem = GetCachedIconBitmap(g_programs[i].icon, menuIconSize);
         
         InsertMenuItemW(hSubMenuAll, i, TRUE, &mii);
     }
@@ -1375,23 +1695,7 @@ void LaunchMode(int argc, WCHAR** argv) {
     DestroyWindow(hHost);
     UnregisterClassW(L"F4MenuPopupHost", g_hInst);
     
-    // Free menu item bitmaps
-    for (int i = 0; i < matchCount; i++) {
-        MENUITEMINFOW mii = {0};
-        mii.cbSize = sizeof(mii);
-        mii.fMask = MIIM_BITMAP;
-        if (GetMenuItemInfoW(hMenu, matchedPrograms[i] + 1, FALSE, &mii) && mii.hbmpItem) {
-            DeleteObject(mii.hbmpItem);
-        }
-    }
-    for (int i = 0; i < g_programCount; i++) {
-        MENUITEMINFOW mii = {0};
-        mii.cbSize = sizeof(mii);
-        mii.fMask = MIIM_BITMAP;
-        if (GetMenuItemInfoW(hSubMenuAll, 10000 + i, FALSE, &mii) && mii.hbmpItem) {
-            DeleteObject(mii.hbmpItem);
-        }
-    }
+    FreeIconCache();
     DestroyMenu(hMenu);
     
     if (selected > 0 && selected <= g_programCount) {
