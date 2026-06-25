@@ -12,6 +12,3 @@
 *.lib
 obj/
 F4Menu/
-
-# User config
-F4Menu.ini
