@@ -1508,7 +1508,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     WCHAR* fileArgs[256];
     int fileArgCount = 0;
     
-    for (int i = 0; i < argc; i++) {
+    for (int i = 1; i < argc; i++) {
         if (_wcsicmp(argv[i], L"/ini") == 0 && i + 1 < argc) {
             wcscpy_s(g_customIniPath, MAX_PATH, argv[++i]);
         } else if (argv[i][0] != L'/') {
