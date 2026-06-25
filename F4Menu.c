@@ -1220,11 +1220,11 @@ void ExecuteProgram(ProgramConfig* prog, WCHAR** files, int fileCount) {
 void LaunchMode(int argc, WCHAR** argv) {
     LoadPrograms();
     
-    if (argc < 2) return;
+    if (argc < 1) return;
     
-    // Extract file extensions
-    WCHAR** files = argv + 1;
-    int fileCount = argc - 1;
+    // Files are directly in argv
+    WCHAR** files = argv;
+    int fileCount = argc;
     
     // Find matching programs
     int matchedPrograms[MAX_PROGRAMS];
