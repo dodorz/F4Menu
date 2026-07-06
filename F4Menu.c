@@ -1675,7 +1675,8 @@ void LaunchMode(int argc, WCHAR** argv) {
     POINT pt;
     GetCursorPos(&pt);
     
-    // Create hidden message-only window as menu owner (fixes popup not appearing)
+    // Create hidden window as menu owner — must be a real window (not HWND_MESSAGE)
+    // so SetForegroundWindow works. Without it the menu won't dismiss on selection.
     WNDCLASSEXW wcMenu = {0};
     wcMenu.cbSize = sizeof(WNDCLASSEXW);
     wcMenu.lpfnWndProc = DefWindowProcW;
@@ -1683,12 +1684,13 @@ void LaunchMode(int argc, WCHAR** argv) {
     wcMenu.lpszClassName = L"F4MenuPopupHost";
     RegisterClassExW(&wcMenu);
     
-    HWND hHost = CreateWindowExW(0, L"F4MenuPopupHost", L"", WS_OVERLAPPED,
-        0, 0, 0, 0, HWND_MESSAGE, NULL, g_hInst, NULL);
+    HWND hHost = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        L"F4MenuPopupHost", L"", WS_POPUP,
+        0, 0, 0, 0, NULL, NULL, g_hInst, NULL);
     
-    // Show menu
+    // Show menu — host must be foreground for proper dismissal
     SetForegroundWindow(hHost);
-    int selected = TrackPopupMenuEx(hMenu, TPM_RETURNCMD | TPM_LEFTBUTTON, 
+    int selected = TrackPopupMenuEx(hMenu, TPM_RETURNCMD | TPM_LEFTBUTTON,
         pt.x, pt.y, hHost, NULL);
     PostMessage(hHost, WM_NULL, 0, 0);
     
