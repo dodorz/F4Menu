@@ -1560,6 +1560,28 @@ static void FreeIconCache() {
     g_iconCacheCount = 0;
 }
 
+// The popup menu is tracked in a nested message loop.  Explicitly end that
+// loop when its owner is deactivated; otherwise a click in another application
+// can leave the menu on screen after the owner has lost the foreground.
+static LRESULT CALLBACK PopupHostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_ACTIVATE:
+            if (LOWORD(wParam) == WA_INACTIVE) EndMenu();
+            break;
+
+        case WM_ACTIVATEAPP:
+            if (!wParam) EndMenu();
+            break;
+
+        case WM_CANCELMODE:
+        case WM_KILLFOCUS:
+            EndMenu();
+            break;
+    }
+
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
 // Launch mode
 void LaunchMode(int argc, WCHAR** argv) {
     LoadPrograms();
@@ -1675,26 +1697,31 @@ void LaunchMode(int argc, WCHAR** argv) {
     POINT pt;
     GetCursorPos(&pt);
     
-    // Create hidden window as menu owner — must be a real window (not HWND_MESSAGE)
-    // so SetForegroundWindow works. Without it the menu won't dismiss on selection.
+    // Create a real, activatable top-level window as the menu owner.  A
+    // WS_EX_NOACTIVATE owner cannot reliably become foreground, which leaves
+    // TrackPopupMenuEx's menu loop running after focus moves elsewhere.
     WNDCLASSEXW wcMenu = {0};
     wcMenu.cbSize = sizeof(WNDCLASSEXW);
-    wcMenu.lpfnWndProc = DefWindowProcW;
+    wcMenu.lpfnWndProc = PopupHostWndProc;
     wcMenu.hInstance = g_hInst;
+    wcMenu.hCursor = LoadCursor(NULL, IDC_ARROW);
     wcMenu.lpszClassName = L"F4MenuPopupHost";
     RegisterClassExW(&wcMenu);
-    
-    HWND hHost = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+
+    HWND hHost = CreateWindowExW(WS_EX_TOOLWINDOW,
         L"F4MenuPopupHost", L"", WS_POPUP,
         0, 0, 0, 0, NULL, NULL, g_hInst, NULL);
-    
-    // Show menu — host must be foreground for proper dismissal
-    SetForegroundWindow(hHost);
-    int selected = TrackPopupMenuEx(hMenu, TPM_RETURNCMD | TPM_LEFTBUTTON,
-        pt.x, pt.y, hHost, NULL);
-    PostMessage(hHost, WM_NULL, 0, 0);
-    
-    DestroyWindow(hHost);
+
+    int selected = 0;
+    if (hHost) {
+        // A popup menu owner must be the foreground window so Windows will
+        // cancel menu tracking when the user switches to another application.
+        SetForegroundWindow(hHost);
+        selected = TrackPopupMenuEx(hMenu, TPM_RETURNCMD | TPM_LEFTBUTTON,
+            pt.x, pt.y, hHost, NULL);
+        PostMessageW(hHost, WM_NULL, 0, 0);
+        DestroyWindow(hHost);
+    }
     UnregisterClassW(L"F4MenuPopupHost", g_hInst);
     
     FreeIconCache();
