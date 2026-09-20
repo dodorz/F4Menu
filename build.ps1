@@ -6,7 +6,7 @@
 #   .\build.ps1 -Verbose          # Show MSBuild output
 
 param(
-    [ValidateSet("x64", "Win32")]
+    [ValidateSet("x64", "Win32", "ARM64")]
     [string]$Platform = "x64",
     [switch]$Clean,
     [switch]$Verbose

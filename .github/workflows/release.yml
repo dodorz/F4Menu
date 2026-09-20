@@ -37,20 +37,33 @@ jobs:
           #endif
           EOF
 
-      - name: Build x64
-        run: msbuild F4Menu.vcxproj /p:Configuration=Release /p:Platform=x64 /v:minimal
-
-      - name: Build Win32
-        run: msbuild F4Menu.vcxproj /p:Configuration=Release /p:Platform=Win32 /v:minimal
+      - name: Build and collect per-platform binaries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($arch in @('x64', 'Win32', 'ARM64')) {
+            Write-Host "=== Building $arch ==="
+            msbuild F4Menu.vcxproj /t:Rebuild /p:Configuration=Release /p:Platform=$arch /p:SolutionDir="$PWD\" /v:minimal /nologo
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+            New-Item -ItemType Directory -Path "dist\$arch" -Force | Out-Null
+            Copy-Item F4Menu.exe "dist\$arch\F4Menu.exe" -Force
+            Copy-Item F4Menu.ini "dist\$arch\F4Menu.ini" -Force
+          }
 
       - name: Package
         shell: bash
         run: |
-          7z a "F4Menu-${{ github.ref_name }}.zip" F4Menu.exe F4Menu.ini
+          TAG="${{ github.ref_name }}"
+          7z a "F4Menu-${TAG}-x64.zip"    ./dist/x64/*
+          7z a "F4Menu-${TAG}-Win32.zip"  ./dist/Win32/*
+          7z a "F4Menu-${TAG}-ARM64.zip"  ./dist/ARM64/*
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           name: v${{ github.ref_name }}
-          files: F4Menu-${{ github.ref_name }}.zip
+          files: |
+            F4Menu-${{ github.ref_name }}-x64.zip
+            F4Menu-${{ github.ref_name }}-Win32.zip
+            F4Menu-${{ github.ref_name }}-ARM64.zip
           generate_release_notes: true
