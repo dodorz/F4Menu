@@ -90,6 +90,9 @@ HWND g_hListView = NULL;
 HIMAGELIST g_hImageList = NULL;
 HFONT g_hFont = NULL;
 
+// Image list index displayed by each ListView row (-1 = no image)
+int g_rowImage[MAX_PROGRAMS];
+
 // Pre-fill data for add dialog
 WCHAR g_prefillPath[MAX_PATH_LEN] = {0};
 WCHAR g_prefillName[MAX_NAME_LEN] = {0};
@@ -130,6 +133,7 @@ void SavePrograms();
 void InitListView(HWND hwnd);
 void PopulateListView();
 void AddProgramToListView(int index);
+void UpdateListViewRow(int row);
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK EditDialogSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR subclassId, DWORD_PTR refData);
 void ShowEditDialog(HWND parent, int index);
@@ -181,6 +185,189 @@ void ExpandEnvStrings(const WCHAR* src, WCHAR* dst, DWORD dstSize) {
 
 // INI file parser - single read, in-memory parse (replaces per-field GetPrivateProfile API calls)
 #define INI_MAX_ENTRIES 1024
+
+// Read a text file into a newly allocated wide-char string.
+// Supported encodings: UTF-16LE (BOM), UTF-8 (BOM or bare) and, when the data is
+// not valid UTF-8, the system ANSI code page (this is what the Win32 profile API
+// writes when every character fits in the ANSI code page).
+static WCHAR* ReadTextFileW(const WCHAR* path) {
+    HANDLE hFile = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return NULL;
+
+    DWORD fileSize = GetFileSize(hFile, NULL);
+    if (fileSize == INVALID_FILE_SIZE || fileSize == 0) {
+        CloseHandle(hFile);
+        return NULL;
+    }
+
+    BYTE* rawBytes = (BYTE*)HeapAlloc(GetProcessHeap(), 0, fileSize);
+    if (!rawBytes) {
+        CloseHandle(hFile);
+        return NULL;
+    }
+
+    DWORD bytesRead = 0;
+    BOOL ok = ReadFile(hFile, rawBytes, fileSize, &bytesRead, NULL);
+    CloseHandle(hFile);
+    if (!ok || bytesRead == 0) {
+        HeapFree(GetProcessHeap(), 0, rawBytes);
+        return NULL;
+    }
+
+    const BYTE* src = rawBytes;
+    UINT srcLen = bytesRead;
+    WCHAR* buffer = NULL;
+    int wideLen = 0;
+
+    if (bytesRead >= 2 && rawBytes[0] == 0xFF && rawBytes[1] == 0xFE) {
+        // UTF-16LE with BOM
+        src += 2;
+        srcLen -= 2;
+        wideLen = (int)(srcLen / sizeof(WCHAR));
+        buffer = (WCHAR*)HeapAlloc(GetProcessHeap(), 0, ((size_t)wideLen + 1) * sizeof(WCHAR));
+        if (buffer) {
+            CopyMemory(buffer, src, (size_t)wideLen * sizeof(WCHAR));
+            buffer[wideLen] = L'\0';
+        }
+        HeapFree(GetProcessHeap(), 0, rawBytes);
+        return buffer;
+    }
+
+    if (bytesRead >= 3 && rawBytes[0] == 0xEF && rawBytes[1] == 0xBB && rawBytes[2] == 0xBF) {
+        src += 3;
+        srcLen -= 3;
+    }
+
+    // UTF-8 first; fall back to the ANSI code page for legacy files
+    UINT codePage = CP_UTF8;
+    wideLen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, (const char*)src, (int)srcLen, NULL, 0);
+    if (wideLen <= 0) {
+        codePage = CP_ACP;
+        wideLen = MultiByteToWideChar(CP_ACP, 0, (const char*)src, (int)srcLen, NULL, 0);
+    }
+
+    if (wideLen > 0) {
+        buffer = (WCHAR*)HeapAlloc(GetProcessHeap(), 0, ((size_t)wideLen + 1) * sizeof(WCHAR));
+        if (buffer) {
+            MultiByteToWideChar(codePage, 0, (const char*)src, (int)srcLen, buffer, wideLen);
+            buffer[wideLen] = L'\0';
+        }
+    }
+
+    HeapFree(GetProcessHeap(), 0, rawBytes);
+    return buffer;
+}
+
+// Write text to a file in a single operation (instead of one full-file rewrite per
+// key, as the profile APIs do). ANSI is used when every character fits in the ANSI
+// code page, UTF-16LE with BOM otherwise - the same format the profile API produces.
+static BOOL WriteTextFileW(const WCHAR* path, const WCHAR* text, int charCount) {
+    if (charCount < 0) charCount = (int)wcslen(text);
+
+    BYTE* bytes = NULL;
+    DWORD byteCount = 0;
+
+    int ansiLen = WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, text, charCount,
+                                      NULL, 0, NULL, NULL);
+    if (ansiLen > 0) {
+        BYTE* ansiBytes = (BYTE*)HeapAlloc(GetProcessHeap(), 0, (size_t)ansiLen + 1);
+        if (ansiBytes) {
+            BOOL usedDefault = FALSE;
+            WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, text, charCount,
+                                (char*)ansiBytes, ansiLen, NULL, &usedDefault);
+            if (usedDefault) {
+                HeapFree(GetProcessHeap(), 0, ansiBytes);
+            } else {
+                bytes = ansiBytes;
+                byteCount = (DWORD)ansiLen;
+            }
+        }
+    }
+
+    if (!bytes) {
+        // Fall back to UTF-16LE with BOM
+        byteCount = (DWORD)(2 + (size_t)charCount * sizeof(WCHAR));
+        bytes = (BYTE*)HeapAlloc(GetProcessHeap(), 0, byteCount);
+        if (!bytes) return FALSE;
+        bytes[0] = 0xFF;
+        bytes[1] = 0xFE;
+        CopyMemory(bytes + 2, text, (size_t)charCount * sizeof(WCHAR));
+    }
+
+    BOOL ok = FALSE;
+    HANDLE hFile = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        ok = WriteFile(hFile, bytes, byteCount, &written, NULL) && written == byteCount;
+        CloseHandle(hFile);
+    }
+
+    HeapFree(GetProcessHeap(), 0, bytes);
+    return ok;
+}
+
+// Growable wide-char text buffer used to build a whole file image in memory
+typedef struct {
+    WCHAR* data;
+    int len;
+    int cap;
+} TextBuf;
+
+static BOOL TextBufGrow(TextBuf* tb, int extra) {
+    if (extra < 0) return FALSE;
+    if (tb->len + extra + 1 <= tb->cap) return TRUE;
+
+    int cap = tb->cap > 0 ? tb->cap : 4096;
+    while (cap < tb->len + extra + 1) {
+        if (cap > (1 << 26)) return FALSE;  // sanity limit (~256 MB of wide text)
+        cap *= 2;
+    }
+
+    WCHAR* p;
+    if (tb->data) {
+        p = (WCHAR*)HeapReAlloc(GetProcessHeap(), 0, tb->data, (size_t)cap * sizeof(WCHAR));
+    } else {
+        p = (WCHAR*)HeapAlloc(GetProcessHeap(), 0, (size_t)cap * sizeof(WCHAR));
+    }
+    if (!p) return FALSE;
+
+    tb->data = p;
+    tb->cap = cap;
+    return TRUE;
+}
+
+static BOOL TextBufAppendN(TextBuf* tb, const WCHAR* s, int count) {
+    if (count <= 0) return TRUE;
+    if (!TextBufGrow(tb, count)) return FALSE;
+
+    CopyMemory(tb->data + tb->len, s, (size_t)count * sizeof(WCHAR));
+    tb->len += count;
+    tb->data[tb->len] = L'\0';
+    return TRUE;
+}
+
+static BOOL TextBufAppend(TextBuf* tb, const WCHAR* s) {
+    return TextBufAppendN(tb, s, (int)wcslen(s));
+}
+
+static void TextBufFree(TextBuf* tb) {
+    if (tb->data) {
+        HeapFree(GetProcessHeap(), 0, tb->data);
+        tb->data = NULL;
+    }
+    tb->len = 0;
+    tb->cap = 0;
+}
+
+// Append "key=value\r\n"
+static BOOL TextBufAppendKey(TextBuf* tb, const WCHAR* key, const WCHAR* value) {
+    if (!TextBufAppend(tb, key)) return FALSE;
+    if (!TextBufAppend(tb, L"=")) return FALSE;
+    if (!TextBufAppend(tb, value)) return FALSE;
+    return TextBufAppend(tb, L"\r\n");
+}
 
 typedef struct {
     WCHAR section[64];
@@ -249,59 +436,8 @@ static void IniParseBuffer(IniFile* ini) {
 }
 
 static BOOL IniLoad(IniFile* ini, const WCHAR* path) {
-    HANDLE hFile = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ,
-                               NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) return FALSE;
-
-    DWORD fileSize = GetFileSize(hFile, NULL);
-    if (fileSize == INVALID_FILE_SIZE || fileSize == 0) {
-        CloseHandle(hFile);
-        return FALSE;
-    }
-
-    BYTE* rawBytes = (BYTE*)HeapAlloc(GetProcessHeap(), 0, fileSize);
-    if (!rawBytes) {
-        CloseHandle(hFile);
-        return FALSE;
-    }
-
-    DWORD bytesRead = 0;
-    BOOL ok = ReadFile(hFile, rawBytes, fileSize, &bytesRead, NULL);
-    CloseHandle(hFile);
-    if (!ok) { HeapFree(GetProcessHeap(), 0, rawBytes); return FALSE; }
-
-    const BYTE* src = rawBytes;
-    UINT srcLen = bytesRead;
-    int skipBom = 0;
-
-    if (bytesRead >= 3 && rawBytes[0] == 0xEF && rawBytes[1] == 0xBB && rawBytes[2] == 0xBF) {
-        skipBom = 3;
-    } else if (bytesRead >= 2 && rawBytes[0] == 0xFF && rawBytes[1] == 0xFE) {
-        src += 2;
-        srcLen -= 2;
-        int wideLen = srcLen / sizeof(WCHAR);
-        ini->buffer = (WCHAR*)HeapAlloc(GetProcessHeap(), 0, (wideLen + 1) * sizeof(WCHAR));
-        if (!ini->buffer) { HeapFree(GetProcessHeap(), 0, rawBytes); return FALSE; }
-        CopyMemory(ini->buffer, src, wideLen * sizeof(WCHAR));
-        ini->buffer[wideLen] = L'\0';
-        HeapFree(GetProcessHeap(), 0, rawBytes);
-        IniParseBuffer(ini);
-        return TRUE;
-    }
-
-    src += skipBom;
-    srcLen -= skipBom;
-
-    int wideLen = MultiByteToWideChar(CP_UTF8, 0, (const char*)src, srcLen, NULL, 0);
-    if (wideLen <= 0) { HeapFree(GetProcessHeap(), 0, rawBytes); return FALSE; }
-
-    ini->buffer = (WCHAR*)HeapAlloc(GetProcessHeap(), 0, (wideLen + 1) * sizeof(WCHAR));
-    if (!ini->buffer) { HeapFree(GetProcessHeap(), 0, rawBytes); return FALSE; }
-
-    MultiByteToWideChar(CP_UTF8, 0, (const char*)src, srcLen, ini->buffer, wideLen);
-    ini->buffer[wideLen] = L'\0';
-
-    HeapFree(GetProcessHeap(), 0, rawBytes);
+    ini->buffer = ReadTextFileW(path);
+    if (!ini->buffer) return FALSE;
 
     IniParseBuffer(ini);
     return TRUE;
@@ -453,42 +589,110 @@ void LoadPrograms() {
     IniFree(&ini);
 }
 
+// Sections owned by this program ([General] and [ProgramN]) - everything else in the
+// INI file is preserved verbatim when saving.
+static BOOL IsManagedSection(const WCHAR* name) {
+    if (_wcsicmp(name, L"General") == 0) return TRUE;
+    if (_wcsnicmp(name, L"Program", 7) != 0) return FALSE;
+    if (name[7] == L'\0') return FALSE;
+
+    for (const WCHAR* p = name + 7; *p; p++) {
+        if (*p < L'0' || *p > L'9') return FALSE;
+    }
+    return TRUE;
+}
+
 // Save programs to INI
+// The whole file image is built in memory and written with a single file write.
+// The previous implementation issued one WritePrivateProfileStringW call per key,
+// and each of those calls rewrites the complete file, which froze the UI for
+// several seconds on every up/down click.
 void SavePrograms() {
+    TextBuf tb = {0};
+
+    // 1. Keep everything that is not managed here (other sections, comments)
+    WCHAR* oldText = ReadTextFileW(g_iniPath);
+    if (oldText) {
+        WCHAR section[64] = {0};
+        BOOL skip = FALSE;
+        const WCHAR* p = oldText;
+
+        while (*p) {
+            const WCHAR* lineEnd = p;
+            while (*lineEnd && *lineEnd != L'\r' && *lineEnd != L'\n') lineEnd++;
+            int lineLen = (int)(lineEnd - p);
+
+            const WCHAR* next = lineEnd;
+            while (*next == L'\r' || *next == L'\n') next++;
+
+            const WCHAR* s = p;
+            while (*s == L' ' || *s == L'\t') s++;
+            if (*s == L'[') {
+                const WCHAR* e = wcschr(s, L']');
+                if (e && (e - s - 1) < (int)(sizeof(section) / sizeof(section[0])) - 1) {
+                    wcsncpy_s(section, 64, s + 1, (size_t)(e - s - 1));
+                    skip = IsManagedSection(section);
+                }
+            }
+
+            if (!skip && !TextBufAppendN(&tb, p, lineLen)) break;
+            if (!skip && !TextBufAppend(&tb, L"\r\n")) break;
+
+            p = next;
+        }
+
+        HeapFree(GetProcessHeap(), 0, oldText);
+
+        // Separate preserved content from the generated blocks
+        if (tb.len > 0) {
+            if (!TextBufAppend(&tb, L"\r\n")) { TextBufFree(&tb); return; }
+        }
+    }
+
+    // 2. [General] Count
     WCHAR buffer[64];
-    
-    // Update count
     swprintf(buffer, 64, L"%d", g_programCount);
-    WritePrivateProfileStringW(L"General", L"Count", buffer, g_iniPath);
-    
-    // Save each program
+    if (!TextBufAppend(&tb, L"[General]\r\n") ||
+        !TextBufAppendKey(&tb, L"Count", buffer)) {
+        TextBufFree(&tb);
+        return;
+    }
+
+    // 3. [ProgramN] blocks
     for (int i = 0; i < g_programCount; i++) {
         WCHAR section[32];
-        swprintf(section, 32, L"Program%d", i);
-        
-        WritePrivateProfileStringW(section, L"Name", g_programs[i].name, g_iniPath);
-        WritePrivateProfileStringW(section, L"Path", g_programs[i].path, g_iniPath);
-        WritePrivateProfileStringW(section, L"Param", g_programs[i].param, g_iniPath);
-        WritePrivateProfileStringW(section, L"Start", g_programs[i].start, g_iniPath);
-        WritePrivateProfileStringW(section, L"Icon", g_programs[i].icon, g_iniPath);
-        WritePrivateProfileStringW(section, L"Type", g_programs[i].type, g_iniPath);
-        
-        swprintf(buffer, 64, L"%d", g_programs[i].mode);
-        WritePrivateProfileStringW(section, L"Mode", buffer, g_iniPath);
-        
-        swprintf(buffer, 64, L"%d", g_programs[i].window);
-        WritePrivateProfileStringW(section, L"Window", buffer, g_iniPath);
-        
+        swprintf(section, 32, L"\r\n[Program%d]\r\n", i);
+
+        if (!TextBufAppend(&tb, section) ||
+            !TextBufAppendKey(&tb, L"Name", g_programs[i].name) ||
+            !TextBufAppendKey(&tb, L"Path", g_programs[i].path) ||
+            !TextBufAppendKey(&tb, L"Param", g_programs[i].param) ||
+            !TextBufAppendKey(&tb, L"Start", g_programs[i].start)) {
+            TextBufFree(&tb);
+            return;
+        }
+
         swprintf(buffer, 64, L"%d", g_programs[i].main);
-        WritePrivateProfileStringW(section, L"Main", buffer, g_iniPath);
+        if (!TextBufAppendKey(&tb, L"Main", buffer)) { TextBufFree(&tb); return; }
+
+        swprintf(buffer, 64, L"%d", g_programs[i].mode);
+        if (!TextBufAppendKey(&tb, L"Mode", buffer)) { TextBufFree(&tb); return; }
+
+        swprintf(buffer, 64, L"%d", g_programs[i].window);
+        if (!TextBufAppendKey(&tb, L"Window", buffer)) { TextBufFree(&tb); return; }
+
+        if (!TextBufAppendKey(&tb, L"Icon", g_programs[i].icon) ||
+            !TextBufAppendKey(&tb, L"Type", g_programs[i].type)) {
+            TextBufFree(&tb);
+            return;
+        }
     }
-    
-    // Remove old program sections
-    for (int i = g_programCount; i < MAX_PROGRAMS; i++) {
-        WCHAR section[32];
-        swprintf(section, 32, L"Program%d", i);
-        WritePrivateProfileStringW(section, NULL, NULL, g_iniPath);
+
+    // 4. One single write
+    if (tb.data) {
+        WriteTextFileW(g_iniPath, tb.data, tb.len);
     }
+    TextBufFree(&tb);
 }
 
 // Load icon from path (format: "path,index")
@@ -551,6 +755,39 @@ void InitListView(HWND hwnd) {
     }
 }
 
+// Refresh a single ListView row in place from the program list.
+// Used when rows are reordered so the whole list (and all icons) does not have to be
+// rebuilt - and, unlike the old code, the icon is moved together with its row.
+void UpdateListViewRow(int row) {
+    if (!g_hListView || row < 0 || row >= g_programCount) return;
+
+    ProgramConfig* prog = &g_programs[row];
+
+    // Keep the row icon in sync with its data (-1 removes the image)
+    LVITEMW item = {0};
+    item.mask = LVIF_IMAGE;
+    item.iItem = row;
+    item.iImage = g_rowImage[row];
+    SendMessageW(g_hListView, LVM_SETITEMW, 0, (LPARAM)&item);
+
+    ListView_SetItemText(g_hListView, row, 1, prog->name);
+    ListView_SetItemText(g_hListView, row, 2, prog->path);
+    ListView_SetItemText(g_hListView, row, 3, prog->param);
+    ListView_SetItemText(g_hListView, row, 4, prog->start);
+
+    WCHAR* modeText = prog->mode == 0 ? L"独立" : L"合并";
+    ListView_SetItemText(g_hListView, row, 5, modeText);
+
+    WCHAR* windowText = prog->window == 0 ? L"常规" : (prog->window == 1 ? L"最大化" : L"最小化");
+    ListView_SetItemText(g_hListView, row, 6, windowText);
+
+    WCHAR mainText[16];
+    swprintf(mainText, 16, L"%d", prog->main);
+    ListView_SetItemText(g_hListView, row, 7, mainText);
+
+    ListView_SetItemText(g_hListView, row, 8, prog->type);
+}
+
 // Add program to ListView
 void AddProgramToListView(int index) {
     if (index < 0 || index >= g_programCount) return;
@@ -561,6 +798,7 @@ void AddProgramToListView(int index) {
     HICON hIcon = LoadIconFromPath(prog->icon);
     int imageIndex = ImageList_AddIcon(g_hImageList, hIcon);
     DestroyIcon(hIcon);
+    g_rowImage[index] = imageIndex;
     
     // Insert item
     LVITEMW item = {0};
@@ -571,22 +809,7 @@ void AddProgramToListView(int index) {
     SendMessageW(g_hListView, LVM_INSERTITEMW, 0, (LPARAM)&item);
     
     // Set subitems
-    ListView_SetItemText(g_hListView, index, 1, prog->name);
-    ListView_SetItemText(g_hListView, index, 2, prog->path);
-    ListView_SetItemText(g_hListView, index, 3, prog->param);
-    ListView_SetItemText(g_hListView, index, 4, prog->start);
-    
-    WCHAR* modeText = prog->mode == 0 ? L"独立" : L"合并";
-    ListView_SetItemText(g_hListView, index, 5, modeText);
-    
-    WCHAR* windowText = prog->window == 0 ? L"常规" : (prog->window == 1 ? L"最大化" : L"最小化");
-    ListView_SetItemText(g_hListView, index, 6, windowText);
-    
-    WCHAR mainText[16];
-    swprintf(mainText, 16, L"%d", prog->main);
-    ListView_SetItemText(g_hListView, index, 7, mainText);
-    
-    ListView_SetItemText(g_hListView, index, 8, prog->type);
+    UpdateListViewRow(index);
 }
 
 // Populate ListView with all programs
@@ -594,9 +817,75 @@ void PopulateListView() {
     SendMessageW(g_hListView, LVM_DELETEALLITEMS, 0, 0);
     ImageList_RemoveAll(g_hImageList);
     
+    for (int i = 0; i < MAX_PROGRAMS; i++) {
+        g_rowImage[i] = -1;
+    }
+    
     for (int i = 0; i < g_programCount; i++) {
         AddProgramToListView(i);
     }
+}
+
+// Move one program from index 'from' to index 'to', shifting the rows in between.
+// The icon index of each row moves with its data.
+static void RotateProgramArray(int from, int to) {
+    if (from == to) return;
+
+    ProgramConfig tmpProg = g_programs[from];
+    int tmpImage = g_rowImage[from];
+
+    if (from < to) {
+        for (int i = from; i < to; i++) {
+            g_programs[i] = g_programs[i + 1];
+            g_rowImage[i] = g_rowImage[i + 1];
+        }
+    } else {
+        for (int i = from; i > to; i--) {
+            g_programs[i] = g_programs[i - 1];
+            g_rowImage[i] = g_rowImage[i - 1];
+        }
+    }
+
+    g_programs[to] = tmpProg;
+    g_rowImage[to] = tmpImage;
+}
+
+// Redraw only the rows in [from, to] (no full repopulation, no icon extraction)
+static void RefreshListViewRows(int from, int to) {
+    if (!g_hListView) return;
+    if (from > to) { int t = from; from = to; to = t; }
+    if (from < 0) from = 0;
+    if (to >= g_programCount) to = g_programCount - 1;
+    if (from > to) return;
+
+    SendMessageW(g_hListView, WM_SETREDRAW, FALSE, 0);
+    for (int i = from; i <= to; i++) {
+        UpdateListViewRow(i);
+    }
+    SendMessageW(g_hListView, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_hListView, NULL, FALSE);
+}
+
+// Move the selected row up (delta = -1) or down (delta = +1) by one position
+static void MoveSelectedProgram(int delta) {
+    if (!g_hListView || g_programCount < 2) return;
+
+    int sel = (int)SendMessageW(g_hListView, LVM_GETNEXTITEM, -1, LVNI_SELECTED);
+    if (sel < 0) return;
+
+    int target = sel + delta;
+    if (target < 0 || target >= g_programCount) return;
+
+    RotateProgramArray(sel, target);
+    RefreshListViewRows(sel, target);
+
+    // Keep the moved row selected and visible
+    ListView_SetItemState(g_hListView, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+    ListView_SetItemState(g_hListView, target, LVIS_SELECTED | LVIS_FOCUSED,
+                          LVIS_SELECTED | LVIS_FOCUSED);
+    ListView_EnsureVisible(g_hListView, target, FALSE);
+
+    SavePrograms();
 }
 
 static BOOL CALLBACK SetFontEnumProc(HWND hwnd, LPARAM lParam) {
@@ -1222,26 +1511,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     return 0;
                 
                 case IDC_BTN_UP: {
-                    int sel = (int)SendMessageW(g_hListView, LVM_GETNEXTITEM, -1, LVNI_SELECTED);
-                    if (sel <= 0) return 0;
-                    ProgramConfig tmp = g_programs[sel];
-                    g_programs[sel] = g_programs[sel - 1];
-                    g_programs[sel - 1] = tmp;
-                    PopulateListView();
-                    SavePrograms();
-                    ListView_SetItemState(g_hListView, sel - 1, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+                    MoveSelectedProgram(-1);
                     return 0;
                 }
                 
                 case IDC_BTN_DOWN: {
-                    int sel = (int)SendMessageW(g_hListView, LVM_GETNEXTITEM, -1, LVNI_SELECTED);
-                    if (sel < 0 || sel >= g_programCount - 1) return 0;
-                    ProgramConfig tmp = g_programs[sel];
-                    g_programs[sel] = g_programs[sel + 1];
-                    g_programs[sel + 1] = tmp;
-                    PopulateListView();
-                    SavePrograms();
-                    ListView_SetItemState(g_hListView, sel + 1, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+                    MoveSelectedProgram(1);
                     return 0;
                 }
                 
@@ -1317,22 +1592,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 ReleaseCapture();
 
                 if (g_dragTarget >= 0 && g_dragTarget != g_dragIndex && g_dragTarget < g_programCount) {
-                    ProgramConfig tmp = g_programs[g_dragIndex];
-                    if (g_dragIndex < g_dragTarget) {
-                        for (int i = g_dragIndex; i < g_dragTarget; i++)
-                            g_programs[i] = g_programs[i + 1];
-                    } else {
-                        for (int i = g_dragIndex; i > g_dragTarget; i--)
-                            g_programs[i] = g_programs[i - 1];
-                    }
-                    g_programs[g_dragTarget] = tmp;
+                    // Reorder the data and refresh only the affected rows
+                    RotateProgramArray(g_dragIndex, g_dragTarget);
+                    RefreshListViewRows(g_dragIndex, g_dragTarget);
 
-                    PopulateListView();
                     SavePrograms();
                     ListView_SetItemState(g_hListView, g_dragTarget, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
-                } else if (g_dragTarget >= 0) {
-                    ListView_SetItemState(g_hListView, g_dragTarget, 0, LVIS_CUT);
                 }
+
+                // Clear the drag highlight
+                ListView_SetItemState(g_hListView, -1, 0, LVIS_CUT);
                 g_dragTarget = -1;
             }
             return 0;
