@@ -507,7 +507,10 @@ void LoadSettings() {
     g_settings.winWidth = LOWORD(winSize);
     g_settings.winHeight = HIWORD(winSize);
     
-    // Default window size if invalid
+    // Default window size if invalid.
+    // Note: CreateWindowExW receives the outer window size, and WM_CLOSE saves
+    // the size from GetWindowRect, so the thresholds below compare like with
+    // like (outer size, not client area).
     if (g_settings.winWidth < DPI_SCALE(400)) g_settings.winWidth = DPI_SCALE(800);
     if (g_settings.winHeight < DPI_SCALE(300)) g_settings.winHeight = DPI_SCALE(600);
     
@@ -1121,30 +1124,62 @@ LRESULT CALLBACK EditDialogSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 void ShowEditDialog(HWND parent, int index) {
     g_selectedIconIndex = 0;
     
-    int dlgW = DPI_SCALE(500);
-    int dlgH = DPI_SCALE(520);
+    // Dialog size is derived from the actual control layout below:
+    // - height: content rows accumulated, buttons anchored to the bottom edge
+    // - width:  content (margin + label + edit + margin), corrected after
+    //   creation by measuring the real frame, so the right margin mirrors
+    //   the left one regardless of theme metrics
+    int margin = DPI_SCALE(10);   // top/bottom/left/right content margin
+    int labelWidth = DPI_SCALE(80);
+    int editWidth = DPI_SCALE(350);
+    int spacing = DPI_SCALE(30);  // single-line row height
+    int editH = DPI_SCALE(22);
+    int btnH = DPI_SCALE(25);
+    // Icon preview list: one row of large (32px) icons plus the item label
+    // underneath and the view's own padding, so the preview fits its content.
+    int iconSize = DPI_SCALE(32);
+    int iconListH = iconSize + DPI_SCALE(24);
+    // Extension edit: 3-line multiline edit
+    int typeH = editH * 3 + DPI_SCALE(8);
+    // Dialog client height: 7 single-line rows, then the icon list, the
+    // extension edit, a gap, the button row and the bottom margin.
+    // The OK/Cancel buttons are anchored to the bottom of the dialog below.
+    int clientH = margin
+                + spacing * 7
+                + iconListH + DPI_SCALE(5)
+                + typeH
+                + DPI_SCALE(10)
+                + btnH
+                + margin;
+    int clientW = margin + labelWidth + editWidth + margin;
+
+    // Create with an initial guess, then measure the actual frame with
+    // AdjustWindowRect and resize so the client area matches clientW x clientH
+    // exactly (avoids theme/DPI frame-metric surprises).
     HWND hwnd = CreateWindowExW(
         WS_EX_DLGMODALFRAME,
         L"#32770",
         L"编辑程序",
         WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME,
-        CW_USEDEFAULT, CW_USEDEFAULT, dlgW, dlgH,
+        CW_USEDEFAULT, CW_USEDEFAULT, clientW + DPI_SCALE(20), clientH + DPI_SCALE(60),
         parent, NULL, g_hInst, NULL
     );
+    if (!hwnd) return;
+
+    RECT frameRc = { 0, 0, clientW, clientH };
+    AdjustWindowRectEx(&frameRc, WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME,
+                       FALSE, WS_EX_DLGMODALFRAME);
+    SetWindowPos(hwnd, NULL, 0, 0,
+                 frameRc.right - frameRc.left, frameRc.bottom - frameRc.top,
+                 SWP_NOZORDER | SWP_NOMOVE | SWP_NOACTIVATE);
     
     if (!hwnd) return;
     
-    int y = DPI_SCALE(10);
-    int lx = DPI_SCALE(10);
-    int labelWidth = DPI_SCALE(80);
-    int editWidth = DPI_SCALE(350);
-    int spacing = DPI_SCALE(30);
-    int editH = DPI_SCALE(22);
-    int btnH = DPI_SCALE(25);
+    int y = margin;
+    int lx = margin;
     int browseW = DPI_SCALE(60);
     int comboW = DPI_SCALE(150);
     int comboH = DPI_SCALE(100);
-    int iconListH = DPI_SCALE(68);
     
     // 名称
     CreateWindowW(L"STATIC", L"名称:", WS_CHILD | WS_VISIBLE, lx, y, labelWidth, editH, hwnd, NULL, g_hInst, NULL);
@@ -1208,17 +1243,19 @@ void ShowEditDialog(HWND parent, int index) {
     SendMessageW(hIconList, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, LVS_EX_DOUBLEBUFFER);
     y += iconListH + DPI_SCALE(5);
     
-    // 扩展名
+    // 扩展名 (multiline, 3 lines)
     CreateWindowW(L"STATIC", L"扩展名:", WS_CHILD | WS_VISIBLE, lx, y, labelWidth, editH, hwnd, NULL, g_hInst, NULL);
-    CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-        lx + labelWidth, y, editWidth, editH, hwnd, (HMENU)IDD_EDIT_TYPE, g_hInst, NULL);
-    y += spacing + DPI_SCALE(10);
+    CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+                    ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL | ES_WANTRETURN,
+                    lx + labelWidth, y, editWidth, typeH, hwnd, (HMENU)IDD_EDIT_TYPE, g_hInst, NULL);
     
-    // 按钮
+    // 按钮 (anchored to the bottom edge of the client area, no dead space below;
+    // right edge of Cancel aligns with the content's right edge)
+    int btnRowY = clientH - margin - btnH;
     CreateWindowW(L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-        lx + labelWidth + editWidth - DPI_SCALE(160), y, DPI_SCALE(70), btnH, hwnd, (HMENU)IDD_BTN_OK, g_hInst, NULL);
+        lx + labelWidth + editWidth - DPI_SCALE(160), btnRowY, DPI_SCALE(70), btnH, hwnd, (HMENU)IDD_BTN_OK, g_hInst, NULL);
     CreateWindowW(L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-        lx + labelWidth + editWidth - DPI_SCALE(80), y, DPI_SCALE(70), btnH, hwnd, (HMENU)IDD_BTN_CANCEL, g_hInst, NULL);
+        lx + labelWidth + editWidth - DPI_SCALE(80), btnRowY, DPI_SCALE(70), btnH, hwnd, (HMENU)IDD_BTN_CANCEL, g_hInst, NULL);
     
     SetDialogFont(hwnd, g_hFont);
     
@@ -1406,7 +1443,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             InitListView(hwnd);
             PopulateListView();
             
-            // Create buttons
+            // Create buttons (initial position only; WM_SIZE re-anchors the row
+            // to the bottom edge with the Exit button aligned to the list's right)
             int btnY = DPI_SCALE(500);
             int btnX = DPI_SCALE(10);
             int btnWidth = DPI_SCALE(65);
@@ -1450,29 +1488,39 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_SIZE: {
             int width = LOWORD(lParam);
             int height = HIWORD(lParam);
-            
-            // Resize ListView
-            SetWindowPos(g_hListView, NULL, DPI_SCALE(10), DPI_SCALE(10), width - DPI_SCALE(20), height - DPI_SCALE(60), SWP_NOZORDER);
-            
-            // Reposition buttons
-            int btnY = height - DPI_SCALE(40);
-            int btnX = DPI_SCALE(10);
-            int btnSpacing = DPI_SCALE(75);
-            
-            SetWindowPos(GetDlgItem(hwnd, IDC_BTN_ADD), NULL, btnX, btnY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
-            btnX += btnSpacing;
-            SetWindowPos(GetDlgItem(hwnd, IDC_BTN_EDIT), NULL, btnX, btnY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
-            btnX += btnSpacing;
-            SetWindowPos(GetDlgItem(hwnd, IDC_BTN_DELETE), NULL, btnX, btnY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
-            btnX += btnSpacing;
-            SetWindowPos(GetDlgItem(hwnd, IDC_BTN_UP), NULL, btnX, btnY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
-            btnX += btnSpacing;
-            SetWindowPos(GetDlgItem(hwnd, IDC_BTN_DOWN), NULL, btnX, btnY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
-            btnX += btnSpacing;
-            SetWindowPos(GetDlgItem(hwnd, IDC_BTN_ABOUT), NULL, btnX, btnY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
-            btnX += btnSpacing;
-            SetWindowPos(GetDlgItem(hwnd, IDC_BTN_EXIT), NULL, btnX, btnY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
-            
+
+            // Button row metrics; a DPI_SCALE(10) gap separates the list from
+            // the buttons (mirroring the DPI_SCALE(10) outer margins).
+            int btnHeight = DPI_SCALE(30);
+            int btnGap = DPI_SCALE(10);
+            int btnRowReserve = btnGap + btnHeight + DPI_SCALE(10); // gap + row + bottom margin
+
+            // Resize ListView so its bottom edge sits btnGap above the button row
+            SetWindowPos(g_hListView, NULL, DPI_SCALE(10), DPI_SCALE(10),
+                         width - DPI_SCALE(20), height - btnRowReserve - DPI_SCALE(10), SWP_NOZORDER);
+
+            // Button row: Add anchors to the ListView's left edge, Exit to its
+            // right edge; the five middle buttons spread evenly in between.
+            int btnY = height - btnRowReserve + btnGap;
+            int btnLeft = DPI_SCALE(10);                   // matches ListView left edge
+            int btnRight = width - DPI_SCALE(10);          // matches ListView right edge
+            int btnW = DPI_SCALE(65);
+            int btnCount = 7;
+
+            // Even spacing: each button's left edge = left + i * step,
+            // except the last which is flush right (step absorbed by widths).
+            int span = btnRight - btnLeft - btnW;          // travel of the button's left edge
+            int step = span / (btnCount - 1);
+
+            const int btnIds[7] = {
+                IDC_BTN_ADD, IDC_BTN_EDIT, IDC_BTN_DELETE, IDC_BTN_UP,
+                IDC_BTN_DOWN, IDC_BTN_ABOUT, IDC_BTN_EXIT
+            };
+            for (int i = 0; i < btnCount; i++) {
+                int bx = btnLeft + (i == btnCount - 1 ? span : step * i);
+                SetWindowPos(GetDlgItem(hwnd, btnIds[i]), NULL, bx, btnY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+            }
+
             return 0;
         }
         
@@ -1607,6 +1655,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         
+        case WM_GETMINMAXINFO: {
+            // Keep the window large enough for the button row (about 525 px
+            // wide for seven buttons) and the list plus button row vertically
+            MINMAXINFO* mmi = (MINMAXINFO*)lParam;
+            mmi->ptMinTrackSize.x = DPI_SCALE(540);
+            mmi->ptMinTrackSize.y = DPI_SCALE(350);
+            return 0;
+        }
+
         case WM_DROPFILES: {
             HDROP hDrop = (HDROP)wParam;
             UINT count = DragQueryFileW(hDrop, 0xFFFFFFFF, NULL, 0);
@@ -1673,13 +1730,37 @@ int ConfigMode() {
     }
     
     // Create main window
+    // Clamp the saved window rectangle to the monitor containing its title
+    // bar.  Without this, a saved position from a previous (larger) monitor
+    // setup can leave the bottom button row off-screen.
+    int cw = g_settings.winWidth;
+    int ch = g_settings.winHeight;
+    int cx = g_settings.winPosX;
+    int cy = g_settings.winPosY;
+
+    HMONITOR hMon = MonitorFromPoint(
+        (POINT){ cx + 100, cy + 20 }, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi = { sizeof(mi) };
+    if (hMon && GetMonitorInfoW(hMon, &mi)) {
+        int workW = mi.rcWork.right - mi.rcWork.left;
+        int workH = mi.rcWork.bottom - mi.rcWork.top;
+        if (cw > workW) cw = workW;
+        if (ch > workH) ch = workH;
+        if (cw < DPI_SCALE(540)) cw = DPI_SCALE(540);
+        if (ch < DPI_SCALE(350)) ch = DPI_SCALE(350);
+        if (cx > mi.rcWork.right - cw) cx = mi.rcWork.right - cw;
+        if (cy > mi.rcWork.bottom - ch) cy = mi.rcWork.bottom - ch;
+        if (cx < mi.rcWork.left) cx = mi.rcWork.left;
+        if (cy < mi.rcWork.top) cy = mi.rcWork.top;
+    }
+
     HWND hwnd = CreateWindowExW(
         0,
         L"F4MenuConfig",
         L"F4Menu - 配置",
         WS_OVERLAPPEDWINDOW,
-        g_settings.winPosX, g_settings.winPosY,
-        g_settings.winWidth, g_settings.winHeight,
+        cx, cy,
+        cw, ch,
         NULL, NULL, g_hInst, NULL
     );
     
