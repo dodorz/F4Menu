@@ -2042,7 +2042,18 @@ void LaunchMode(int argc, WCHAR** argv) {
     miiOther.wID = 9001;
     miiOther.dwTypeData = L"其它程序...";
     InsertMenuItemW(hMenu, matchCount + 3, TRUE, &miiOther);
-    
+
+    // Add separator
+    InsertMenuItemW(hMenu, matchCount + 4, TRUE, &sep);
+
+    // "设置" item
+    MENUITEMINFOW miiSettings = {0};
+    miiSettings.cbSize = sizeof(miiSettings);
+    miiSettings.fMask = MIIM_STRING | MIIM_ID;
+    miiSettings.wID = 9002;
+    miiSettings.dwTypeData = L"设置";
+    InsertMenuItemW(hMenu, matchCount + 5, TRUE, &miiSettings);
+
     // Get cursor position
     POINT pt;
     GetCursorPos(&pt);
@@ -2081,6 +2092,9 @@ void LaunchMode(int argc, WCHAR** argv) {
         ExecuteProgram(&g_programs[selected - 1], files, fileCount);
     } else if (selected >= 10000 && selected < 10000 + g_programCount) {
         ExecuteProgram(&g_programs[selected - 10000], files, fileCount);
+    } else if (selected == 9002) {
+        // "设置" - open config mode
+        ConfigMode();
     } else if (selected == 9001) {
         // "其它程序..." - like main window "Add" button: select exe first, then show edit dialog
         OPENFILENAMEW ofn = {0};
