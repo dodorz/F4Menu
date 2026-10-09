@@ -3,15 +3,15 @@
 #define F4MENU_VERSION_H
 
 #ifndef F4MENU_VERSION_A
-#define F4MENU_VERSION_A "1.0.0"
+#define F4MENU_VERSION_A "0.1.0"
 #endif
 
 #ifndef F4MENU_VER_MAJOR
-#define F4MENU_VER_MAJOR 1
+#define F4MENU_VER_MAJOR 0
 #endif
 
 #ifndef F4MENU_VER_MINOR
-#define F4MENU_VER_MINOR 0
+#define F4MENU_VER_MINOR 1
 #endif
 
 #ifndef F4MENU_VER_PATCH

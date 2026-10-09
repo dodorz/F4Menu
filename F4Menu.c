@@ -38,6 +38,19 @@
 #define MAX_PARAM_LEN 512
 #define MAX_TYPE_LEN 1024
 #define MAX_NAME_LEN 256
+#define MAX_EXTRA_LEN 1024     // keys of a program section this version does not know
+#define MAX_COMMENT_LEN 1024   // comment lines kept inside a program section
+
+// Launch mode of a program
+#define MODE_SEPARATE 0
+#define MODE_MERGE 1
+#define MODE_INHERIT (-1)    // take the [General] default
+
+// Window state requested on launch
+#define WINDOW_NORMAL 0
+#define WINDOW_MAX 1
+#define WINDOW_MIN 2
+#define WINDOW_INHERIT (-1)  // take the [General] default
 
 #define IDC_LISTVIEW 1001
 #define IDC_BTN_ADD 1002
@@ -64,7 +77,11 @@
 #define IDD_ICON_LIST 2013
 #define IDD_ICON_INDEX 2014
 
-// Program configuration structure
+// Program configuration structure.
+// A program is one section of the config file: the section header is its display
+// name and the position of the section in the file is its position in the list.
+// 'extra' and 'comments' carry over the parts of a section this version does not
+// interpret, so hand-written notes and keys survive a rewrite.
 typedef struct {
     WCHAR name[MAX_NAME_LEN];
     WCHAR path[MAX_PATH_LEN];
@@ -72,9 +89,10 @@ typedef struct {
     WCHAR start[MAX_PATH_LEN];
     WCHAR icon[MAX_PATH_LEN];
     WCHAR type[MAX_TYPE_LEN];
-    int mode;      // 0=独立, 1=合并
-    int window;    // 0=常规, 1=最大化, 2=最小化
-    int main;      // Reserved
+    int mode;                 // MODE_SEPARATE, MODE_MERGE or MODE_INHERIT
+    int window;               // WINDOW_NORMAL/MAX/MIN or WINDOW_INHERIT
+    WCHAR extra[MAX_EXTRA_LEN];
+    WCHAR comments[MAX_COMMENT_LEN];
 } ProgramConfig;
 
 // DPI scaling
@@ -86,6 +104,10 @@ HINSTANCE g_hInst;
 WCHAR g_iniPath[MAX_PATH];
 ProgramConfig g_programs[MAX_PROGRAMS];
 int g_programCount = 0;
+
+// [General] defaults, applied to every program that does not set its own
+int g_defaultMode = MODE_SEPARATE;
+int g_defaultWindow = WINDOW_NORMAL;
 HWND g_hListView = NULL;
 HIMAGELIST g_hImageList = NULL;
 HFONT g_hFont = NULL;
@@ -113,7 +135,7 @@ typedef struct {
     int winPosY;
     int winWidth;
     int winHeight;
-    int columnWidths[9];
+    int columnWidths[8];
 } Settings;
 
 Settings g_settings = {0};
@@ -184,7 +206,8 @@ void ExpandEnvStrings(const WCHAR* src, WCHAR* dst, DWORD dstSize) {
 }
 
 // INI file parser - single read, in-memory parse (replaces per-field GetPrivateProfile API calls)
-#define INI_MAX_ENTRIES 1024
+#define INI_MAX_ENTRIES 4096
+#define INI_MAX_SECTIONS 256
 
 // Read a text file into a newly allocated wide-char string.
 // Supported encodings: UTF-16LE (BOM), UTF-8 (BOM or bare) and, when the data is
@@ -260,41 +283,23 @@ static WCHAR* ReadTextFileW(const WCHAR* path) {
 }
 
 // Write text to a file in a single operation (instead of one full-file rewrite per
-// key, as the profile APIs do). ANSI is used when every character fits in the ANSI
-// code page, UTF-16LE with BOM otherwise - the same format the profile API produces.
+// key, as the profile APIs do). Always UTF-8 with BOM: section names are user data
+// and may contain characters the ANSI code page cannot represent.
 static BOOL WriteTextFileW(const WCHAR* path, const WCHAR* text, int charCount) {
     if (charCount < 0) charCount = (int)wcslen(text);
 
-    BYTE* bytes = NULL;
-    DWORD byteCount = 0;
+    int utf8Len = WideCharToMultiByte(CP_UTF8, 0, text, charCount, NULL, 0, NULL, NULL);
+    if (utf8Len <= 0) return FALSE;
 
-    int ansiLen = WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, text, charCount,
-                                      NULL, 0, NULL, NULL);
-    if (ansiLen > 0) {
-        BYTE* ansiBytes = (BYTE*)HeapAlloc(GetProcessHeap(), 0, (size_t)ansiLen + 1);
-        if (ansiBytes) {
-            BOOL usedDefault = FALSE;
-            WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, text, charCount,
-                                (char*)ansiBytes, ansiLen, NULL, &usedDefault);
-            if (usedDefault) {
-                HeapFree(GetProcessHeap(), 0, ansiBytes);
-            } else {
-                bytes = ansiBytes;
-                byteCount = (DWORD)ansiLen;
-            }
-        }
-    }
+    BYTE* bytes = (BYTE*)HeapAlloc(GetProcessHeap(), 0, (size_t)utf8Len + 3);
+    if (!bytes) return FALSE;
 
-    if (!bytes) {
-        // Fall back to UTF-16LE with BOM
-        byteCount = (DWORD)(2 + (size_t)charCount * sizeof(WCHAR));
-        bytes = (BYTE*)HeapAlloc(GetProcessHeap(), 0, byteCount);
-        if (!bytes) return FALSE;
-        bytes[0] = 0xFF;
-        bytes[1] = 0xFE;
-        CopyMemory(bytes + 2, text, (size_t)charCount * sizeof(WCHAR));
-    }
+    bytes[0] = 0xEF;
+    bytes[1] = 0xBB;
+    bytes[2] = 0xBF;
+    WideCharToMultiByte(CP_UTF8, 0, text, charCount, (char*)(bytes + 3), utf8Len, NULL, NULL);
 
+    DWORD byteCount = (DWORD)utf8Len + 3;
     BOOL ok = FALSE;
     HANDLE hFile = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -369,15 +374,18 @@ static BOOL TextBufAppendKey(TextBuf* tb, const WCHAR* key, const WCHAR* value) 
     return TextBufAppend(tb, L"\r\n");
 }
 
+// One parsed line of an INI file. section/key/value point into IniFile::buffer and
+// stay valid until IniFree. Comment lines are kept as entries with key == NULL so
+// that comments living inside a program section survive a rewrite of the file.
 typedef struct {
-    WCHAR section[64];
-    WCHAR* key;
-    WCHAR* value;
+    const WCHAR* section;   // NULL while no section header has been seen yet
+    const WCHAR* key;       // NULL for comment lines
+    const WCHAR* value;
 } IniEntry;
 
 typedef struct {
     WCHAR* buffer;
-    IniEntry entries[INI_MAX_ENTRIES];
+    IniEntry* entries;
     int count;
 } IniFile;
 
@@ -386,48 +394,67 @@ static void IniFree(IniFile* ini) {
         HeapFree(GetProcessHeap(), 0, ini->buffer);
         ini->buffer = NULL;
     }
+    if (ini->entries) {
+        HeapFree(GetProcessHeap(), 0, ini->entries);
+        ini->entries = NULL;
+    }
     ini->count = 0;
 }
 
-static void IniParseBuffer(IniFile* ini) {
+// Parse a text buffer the caller owns; IniFile takes over the buffer.
+static void IniParseText(IniFile* ini, WCHAR* text) {
     ini->count = 0;
+    ini->buffer = text;
+    ini->entries = NULL;
+    if (!text) return;
 
-    WCHAR curSection[64] = {0};
+    ini->entries = (IniEntry*)HeapAlloc(GetProcessHeap(), 0, sizeof(IniEntry) * INI_MAX_ENTRIES);
+    if (!ini->entries) return;
+
+    const WCHAR* curSection = NULL;
     WCHAR* context = NULL;
-    WCHAR* line = wcstok_s(ini->buffer, L"\r\n", &context);
+    WCHAR* line = wcstok_s(text, L"\r\n", &context);
 
     while (line && ini->count < INI_MAX_ENTRIES) {
-        while (*line == L' ' || *line == L'\t') line++;
-        if (*line == L'\0') { line = wcstok_s(NULL, L"\r\n", &context); continue; }
+        WCHAR* p = line;
+        while (*p == L' ' || *p == L'\t') p++;
+        if (*p == L'\0') { line = wcstok_s(NULL, L"\r\n", &context); continue; }
 
-        if (*line == L'[') {
-            WCHAR* end = wcschr(line, L']');
+        if (*p == L'[') {
+            WCHAR* end = wcschr(p, L']');
             if (end) {
                 *end = L'\0';
-                wcscpy_s(curSection, 64, line + 1);
+                curSection = p + 1;
+                WCHAR* e = (WCHAR*)curSection + wcslen(curSection);
+                while (e > (WCHAR*)curSection && (e[-1] == L' ' || e[-1] == L'\t')) *--e = L'\0';
             }
             line = wcstok_s(NULL, L"\r\n", &context);
             continue;
         }
 
-        if (*line == L';' || *line == L'#') {
+        IniEntry* entry = &ini->entries[ini->count];
+        entry->section = curSection;
+
+        if (*p == L';' || *p == L'#') {
+            entry->key = NULL;
+            entry->value = p;
+            ini->count++;
             line = wcstok_s(NULL, L"\r\n", &context);
             continue;
         }
 
-        WCHAR* eq = wcschr(line, L'=');
+        WCHAR* eq = wcschr(p, L'=');
         if (eq) {
             *eq = L'\0';
-            WCHAR* key = line;
+            WCHAR* key = p;
             WCHAR* value = eq + 1;
 
             size_t klen = wcslen(key);
             while (klen > 0 && (key[klen - 1] == L' ' || key[klen - 1] == L'\t'))
                 key[--klen] = L'\0';
 
-            wcscpy_s(ini->entries[ini->count].section, 64, curSection);
-            ini->entries[ini->count].key = key;
-            ini->entries[ini->count].value = value;
+            entry->key = key;
+            entry->value = value;
             ini->count++;
         }
 
@@ -436,26 +463,29 @@ static void IniParseBuffer(IniFile* ini) {
 }
 
 static BOOL IniLoad(IniFile* ini, const WCHAR* path) {
-    ini->buffer = ReadTextFileW(path);
-    if (!ini->buffer) return FALSE;
+    WCHAR* text = ReadTextFileW(path);
+    if (!text) return FALSE;
 
-    IniParseBuffer(ini);
+    IniParseText(ini, text);
     return TRUE;
 }
 
-static WCHAR* IniGet(IniFile* ini, const WCHAR* section, const WCHAR* key) {
+static BOOL SectionEquals(const WCHAR* a, int aLen, const WCHAR* b, int bLen) {
+    return aLen == bLen && _wcsnicmp(a, b, aLen) == 0;
+}
+
+static const WCHAR* IniGetN(IniFile* ini, const WCHAR* section, int sectionLen, const WCHAR* key) {
     for (int i = 0; i < ini->count; i++) {
-        if (_wcsicmp(ini->entries[i].section, section) == 0 &&
-            _wcsicmp(ini->entries[i].key, key) == 0) {
-            return ini->entries[i].value;
-        }
+        const IniEntry* entry = &ini->entries[i];
+        if (!entry->key || !entry->section) continue;
+        if (!SectionEquals(entry->section, (int)wcslen(entry->section), section, sectionLen)) continue;
+        if (_wcsicmp(entry->key, key) == 0) return entry->value;
     }
     return NULL;
 }
 
-static int IniGetInt(IniFile* ini, const WCHAR* section, const WCHAR* key, int def) {
-    WCHAR* val = IniGet(ini, section, key);
-    return val ? _wtoi(val) : def;
+static const WCHAR* IniGet(IniFile* ini, const WCHAR* section, const WCHAR* key) {
+    return IniGetN(ini, section, (int)wcslen(section), key);
 }
 
 // Extract product name from PE version info
@@ -514,22 +544,30 @@ void LoadSettings() {
     if (g_settings.winWidth < DPI_SCALE(400)) g_settings.winWidth = DPI_SCALE(800);
     if (g_settings.winHeight < DPI_SCALE(300)) g_settings.winHeight = DPI_SCALE(600);
     
-    // Load column widths
+    // Load column widths. Configurations written by older versions still contain
+    // the removed "Main" column, so a 9-value string is mapped without it.
     WCHAR columnStr[512] = {0};
-    GetPrivateProfileStringW(L"Settings", L"Column", L"24,150,200,100,150,60,60,60,150,", 
+    GetPrivateProfileStringW(L"Settings", L"Column", L"24,150,200,100,150,60,60,150,",
                              columnStr, 512, g_datPath);
-    
-    int idx = 0;
+
+    int widths[16] = {0};
+    int n = 0;
     WCHAR* context = NULL;
     WCHAR* token = wcstok(columnStr, L",", &context);
-    while (token && idx < 9) {
-        g_settings.columnWidths[idx++] = _wtoi(token);
+    while (token && n < 16) {
+        widths[n++] = _wtoi(token);
         token = wcstok(NULL, L",", &context);
     }
-    
+
+    const int legacyMainColumn = 7;
+    for (int i = 0; i < 8; i++) {
+        int src = (n > 8 && i >= legacyMainColumn) ? i + 1 : i;
+        g_settings.columnWidths[i] = src < n ? widths[src] : 0;
+    }
+
     // Default column widths
-    int defaults[] = {24, 150, 200, 100, 150, 60, 60, 60, 150};
-    for (int i = 0; i < 9; i++) {
+    int defaults[8] = {24, 150, 200, 100, 150, 60, 60, 150};
+    for (int i = 0; i < 8; i++) {
         if (g_settings.columnWidths[i] <= 0) {
             g_settings.columnWidths[i] = defaults[i];
         }
@@ -552,7 +590,7 @@ void SaveSettings() {
     // Save column widths
     WCHAR columnStr[512] = {0};
     WCHAR temp[32];
-    for (int i = 0; i < 9; i++) {
+    for (int i = 0; i < 8; i++) {
         int width = (int)SendMessageW(g_hListView, LVM_GETCOLUMNWIDTH, i, 0);
         if (width > 0) {
             swprintf(temp, 32, L"%d,", width);
@@ -562,140 +600,395 @@ void SaveSettings() {
     WritePrivateProfileStringW(L"Settings", L"Column", columnStr, g_datPath);
 }
 
-// Load programs from INI (single-read in-memory parser)
+// ---------------------------------------------------------------------------
+// Program configuration file format
+//
+// One section per program, in list order: the section header is the display
+// name, so adding an entry means adding a section and removing one means
+// removing a section - there is no counter to keep in sync. A section is a
+// program if and only if it carries a non-empty Path key. [General] is managed
+// too and holds the defaults; every other section, comment and blank line in the
+// file is preserved verbatim.
+// ---------------------------------------------------------------------------
+
+static int ParseModeValue(const WCHAR* value) {
+    if (!value || !*value) return MODE_SEPARATE;
+    if (_wcsicmp(value, L"merge") == 0 || _wcsicmp(value, L"1") == 0) return MODE_MERGE;
+    return MODE_SEPARATE;   // "separate", legacy 0, or anything unrecognized
+}
+
+static int ParseWindowValue(const WCHAR* value) {
+    if (!value || !*value) return WINDOW_NORMAL;
+    if (_wcsicmp(value, L"max") == 0 || _wcsicmp(value, L"maximized") == 0 || _wcsicmp(value, L"1") == 0)
+        return WINDOW_MAX;
+    if (_wcsicmp(value, L"min") == 0 || _wcsicmp(value, L"minimized") == 0 || _wcsicmp(value, L"2") == 0)
+        return WINDOW_MIN;
+    return WINDOW_NORMAL;   // "normal", legacy 0, or anything unrecognized
+}
+
+static const WCHAR* ModeName(int mode) {
+    return (mode == MODE_MERGE) ? L"merge" : L"separate";
+}
+
+static const WCHAR* WindowName(int window) {
+    if (window == WINDOW_MAX) return L"max";
+    if (window == WINDOW_MIN) return L"min";
+    return L"normal";
+}
+
+// Mode and Window are left out of the file when they are the default, so a
+// program only carries the values it actually differs on. Changing a default in
+// [General] therefore reaches every program that did not choose its own value.
+static int ProgramMode(const ProgramConfig* prog) {
+    return (prog->mode == MODE_INHERIT) ? g_defaultMode : prog->mode;
+}
+
+static int ProgramWindow(const ProgramConfig* prog) {
+    return (prog->window == WINDOW_INHERIT) ? g_defaultWindow : prog->window;
+}
+
+// A program name is also a section header, so the characters that would end the
+// header or split the line are dropped and the rest is trimmed.
+static void SanitizeProgramName(WCHAR* name) {
+    WCHAR* w = name;
+    WCHAR* r = name;
+    while (*w) {
+        if (*w != L'[' && *w != L']' && *w != L'\r' && *w != L'\n') *r++ = *w;
+        w++;
+    }
+    *r = L'\0';
+
+    WCHAR* first = name;
+    while (*first == L' ' || *first == L'\t') first++;
+    if (first != name) {
+        size_t len = wcslen(first);
+        MoveMemory(name, first, (len + 1) * sizeof(WCHAR));
+    }
+
+    size_t len = wcslen(name);
+    while (len > 0 && (name[len - 1] == L' ' || name[len - 1] == L'\t')) name[--len] = L'\0';
+}
+
+// Fallback display name for a program whose section header is blank
+static void ProgramNameFromPath(const WCHAR* path, WCHAR* out, size_t outSize) {
+    const WCHAR* lastSlash = wcsrchr(path, L'\\');
+    const WCHAR* stem = lastSlash ? lastSlash + 1 : path;
+
+    size_t len = wcslen(stem);
+    for (size_t i = 0; i < len; i++) {
+        if (stem[i] == L'.') {
+            if (i > 0) len = i;
+            break;
+        }
+    }
+
+    if (len == 0 || len >= outSize) {
+        wcscpy_s(out, outSize, L"Program");
+        return;
+    }
+
+    CopyMemory(out, stem, len * sizeof(WCHAR));
+    out[len] = L'\0';
+}
+
+// The section header is the identity of a program, so two programs must not end
+// up with the same name: a "#2", "#3" ... suffix is appended until it is free.
+static void MakeProgramNameUnique(WCHAR* name, int ignoreIndex) {
+    WCHAR base[MAX_NAME_LEN];
+    wcscpy_s(base, MAX_NAME_LEN, name);
+
+    for (int n = 2; n < 1000; n++) {
+        BOOL clash = FALSE;
+        for (int i = 0; i < g_programCount; i++) {
+            if (i == ignoreIndex) continue;
+            if (_wcsicmp(g_programs[i].name, name) == 0) {
+                clash = TRUE;
+                break;
+            }
+        }
+        if (!clash) return;
+
+        WCHAR suffix[16];
+        swprintf(suffix, 16, L"#%d", n);
+
+        size_t baseLen = wcslen(base);
+        size_t suffixLen = wcslen(suffix);
+        size_t keep = (baseLen + suffixLen < MAX_NAME_LEN) ? baseLen : MAX_NAME_LEN - suffixLen - 1;
+        CopyMemory(name, base, keep * sizeof(WCHAR));
+        wcscpy_s(name + keep, MAX_NAME_LEN - keep, suffix);
+    }
+}
+
+// Name and Main belong to the old numbered format: recognized so that they are
+// dropped instead of being carried over as unknown keys.
+static BOOL IsKnownProgramKey(const WCHAR* key) {
+    static const WCHAR* const known[] = {
+        L"Name", L"Path", L"Param", L"Start", L"Icon", L"Type", L"Mode", L"Window", L"Main"
+    };
+    for (int i = 0; i < (int)(sizeof(known) / sizeof(known[0])); i++) {
+        if (_wcsicmp(key, known[i]) == 0) return TRUE;
+    }
+    return FALSE;
+}
+
+// Append one "text\r\n" line, dropping whatever no longer fits
+static void AppendLine(WCHAR* dst, size_t size, const WCHAR* text) {
+    size_t len = wcslen(dst);
+    size_t add = wcslen(text);
+    if (len + add + 2 >= size) return;
+
+    CopyMemory(dst + len, text, add * sizeof(WCHAR));
+    dst[len + add] = L'\r';
+    dst[len + add + 1] = L'\n';
+    dst[len + add + 2] = L'\0';
+}
+
+// Keep the comments of a program section and the keys this version does not know,
+// so hand-written notes and foreign keys survive a rewrite of the file.
+static void CollectSectionCarryOver(ProgramConfig* prog, IniFile* ini, const WCHAR* section) {
+    WCHAR extra[MAX_EXTRA_LEN] = {0};
+    WCHAR comments[MAX_COMMENT_LEN] = {0};
+
+    for (int i = 0; i < ini->count; i++) {
+        const IniEntry* entry = &ini->entries[i];
+        if (!entry->section || _wcsicmp(entry->section, section) != 0) continue;
+
+        if (!entry->key) {
+            AppendLine(comments, MAX_COMMENT_LEN, entry->value);
+            continue;
+        }
+        if (IsKnownProgramKey(entry->key)) continue;
+
+        WCHAR line[MAX_NAME_LEN + MAX_PATH_LEN + 8] = {0};
+        if (wcslen(entry->key) + wcslen(entry->value) + 3 >= sizeof(line) / sizeof(line[0])) continue;
+        swprintf(line, sizeof(line) / sizeof(line[0]), L"%s=%s", entry->key, entry->value);
+        AppendLine(extra, MAX_EXTRA_LEN, line);
+    }
+
+    wcscpy_s(prog->extra, MAX_EXTRA_LEN, extra);
+    wcscpy_s(prog->comments, MAX_COMMENT_LEN, comments);
+}
+
+// Copy a value from the file into a field: over-long values are truncated instead
+// of being dropped, which wcscpy_s would do.
+static void CopyField(WCHAR* dst, size_t size, const WCHAR* src) {
+    if (!src) {
+        dst[0] = L'\0';
+        return;
+    }
+
+    size_t len = wcslen(src);
+    if (len >= size) len = size - 1;
+    CopyMemory(dst, src, len * sizeof(WCHAR));
+    dst[len] = L'\0';
+}
+
+static void LoadProgramFromSection(ProgramConfig* prog, IniFile* ini, const WCHAR* section, const WCHAR* path) {
+    memset(prog, 0, sizeof(*prog));
+
+    // The section header is the display name; configurations written by older
+    // versions used a numbered section plus a Name key, which still works.
+    const WCHAR* val = IniGet(ini, section, L"Name");
+    if (!val || !*val) val = section;
+    CopyField(prog->name, MAX_NAME_LEN, val);
+    SanitizeProgramName(prog->name);
+    if (prog->name[0] == L'\0') ProgramNameFromPath(path, prog->name, MAX_NAME_LEN);
+
+    CopyField(prog->path, MAX_PATH_LEN, path);
+
+    val = IniGet(ini, section, L"Param");  if (val) CopyField(prog->param, MAX_PARAM_LEN, val);
+    val = IniGet(ini, section, L"Start");  if (val) CopyField(prog->start, MAX_PATH_LEN, val);
+    val = IniGet(ini, section, L"Icon");   if (val) CopyField(prog->icon, MAX_PATH_LEN, val);
+    val = IniGet(ini, section, L"Type");   if (val) CopyField(prog->type, MAX_TYPE_LEN, val);
+
+    // A value equal to the default is not worth a line in the file
+    val = IniGet(ini, section, L"Mode");
+    prog->mode = (val && *val) ? ParseModeValue(val) : MODE_INHERIT;
+    if (prog->mode == g_defaultMode) prog->mode = MODE_INHERIT;
+
+    val = IniGet(ini, section, L"Window");
+    prog->window = (val && *val) ? ParseWindowValue(val) : WINDOW_INHERIT;
+    if (prog->window == g_defaultWindow) prog->window = WINDOW_INHERIT;
+
+    CollectSectionCarryOver(prog, ini, section);
+}
+
+// Load programs from the config file (single-read in-memory parser)
 void LoadPrograms() {
     GetIniFilePath(g_iniPath, MAX_PATH);
+    g_programCount = 0;
 
     IniFile ini = {0};
     if (!IniLoad(&ini, g_iniPath)) return;
 
-    g_programCount = IniGetInt(&ini, L"General", L"Count", 0);
-    if (g_programCount > MAX_PROGRAMS) g_programCount = MAX_PROGRAMS;
+    // Defaults every program inherits unless it sets its own
+    const WCHAR* val = IniGet(&ini, L"General", L"DefaultMode");
+    g_defaultMode = (val && *val) ? ParseModeValue(val) : MODE_SEPARATE;
+    val = IniGet(&ini, L"General", L"DefaultWindow");
+    g_defaultWindow = (val && *val) ? ParseWindowValue(val) : WINDOW_NORMAL;
 
-    for (int i = 0; i < g_programCount; i++) {
-        WCHAR section[32];
-        swprintf(section, 32, L"Program%d", i);
+    // Sections are taken in the order they appear in the file, and a section is a
+    // program when it has a non-empty Path key.
+    const WCHAR* seen[INI_MAX_SECTIONS];
+    int seenCount = 0;
 
-        WCHAR* val;
-        val = IniGet(&ini, section, L"Name");   if (val) wcscpy_s(g_programs[i].name, MAX_NAME_LEN, val);
-        val = IniGet(&ini, section, L"Path");   if (val) wcscpy_s(g_programs[i].path, MAX_PATH_LEN, val);
-        val = IniGet(&ini, section, L"Param");  if (val) wcscpy_s(g_programs[i].param, MAX_PARAM_LEN, val);
-        val = IniGet(&ini, section, L"Start");  if (val) wcscpy_s(g_programs[i].start, MAX_PATH_LEN, val);
-        val = IniGet(&ini, section, L"Icon");   if (val) wcscpy_s(g_programs[i].icon, MAX_PATH_LEN, val);
-        val = IniGet(&ini, section, L"Type");   if (val) wcscpy_s(g_programs[i].type, MAX_TYPE_LEN, val);
+    for (int i = 0; i < ini.count; i++) {
+        const WCHAR* section = ini.entries[i].section;
+        if (!section || !ini.entries[i].key) continue;
+        if (seenCount >= INI_MAX_SECTIONS) break;
 
-        g_programs[i].mode = IniGetInt(&ini, section, L"Mode", 0);
-        g_programs[i].window = IniGetInt(&ini, section, L"Window", 0);
-        g_programs[i].main = IniGetInt(&ini, section, L"Main", 0);
+        BOOL known = FALSE;
+        for (int s = 0; s < seenCount; s++) {
+            if (_wcsicmp(seen[s], section) == 0) {
+                known = TRUE;
+                break;
+            }
+        }
+        if (known) continue;
+        seen[seenCount++] = section;
+
+        const WCHAR* path = IniGet(&ini, section, L"Path");
+        if (!path || !*path) continue;
+        if (g_programCount >= MAX_PROGRAMS) break;
+
+        LoadProgramFromSection(&g_programs[g_programCount], &ini, section, path);
+        MakeProgramNameUnique(g_programs[g_programCount].name, -1);
+        g_programCount++;
     }
 
     IniFree(&ini);
 }
 
-// Sections owned by this program ([General] and [ProgramN]) - everything else in the
-// INI file is preserved verbatim when saving.
-static BOOL IsManagedSection(const WCHAR* name) {
-    if (_wcsicmp(name, L"General") == 0) return TRUE;
-    if (_wcsnicmp(name, L"Program", 7) != 0) return FALSE;
-    if (name[7] == L'\0') return FALSE;
+// The sections the program owns: the programs themselves plus the [General]
+// defaults. Everything else in the file belongs to the user.
+static BOOL IsManagedSection(IniFile* ini, const WCHAR* section, int sectionLen) {
+    if (SectionEquals(section, sectionLen, L"General", 7)) return TRUE;
 
-    for (const WCHAR* p = name + 7; *p; p++) {
-        if (*p < L'0' || *p > L'9') return FALSE;
-    }
-    return TRUE;
+    const WCHAR* path = IniGetN(ini, section, sectionLen, L"Path");
+    return path && *path;
 }
 
-// Save programs to INI
+// Copy every line the program does not manage: comments, blank lines, and all
+// sections that are neither a program nor the [General] defaults.
+static void CopyUnmanagedLines(TextBuf* tb, const WCHAR* text, IniFile* ini) {
+    const WCHAR* section = NULL;
+    int sectionLen = 0;
+    BOOL skip = FALSE;
+
+    const WCHAR* p = text;
+    while (*p) {
+        const WCHAR* lineEnd = p;
+        while (*lineEnd && *lineEnd != L'\r' && *lineEnd != L'\n') lineEnd++;
+        int lineLen = (int)(lineEnd - p);
+
+        // Step over one line ending only, so that an empty line is a line of its own
+        const WCHAR* next = lineEnd;
+        if (*next == L'\r' && next[1] == L'\n') next += 2;
+        else if (*next == L'\r' || *next == L'\n') next += 1;
+
+        const WCHAR* s = p;
+        while (*s == L' ' || *s == L'\t') s++;
+
+        if (*s == L'[') {
+            const WCHAR* e = wcschr(s, L']');
+            if (e) {
+                section = s + 1;
+                sectionLen = (int)(e - s - 1);
+                while (sectionLen > 0 && (section[sectionLen - 1] == L' ' || section[sectionLen - 1] == L'\t'))
+                    sectionLen--;
+
+                skip = IsManagedSection(ini, section, sectionLen);
+            }
+        }
+
+        if (!skip) {
+            TextBufAppendN(tb, p, lineLen);
+            TextBufAppend(tb, L"\r\n");
+        }
+
+        p = next;
+    }
+}
+
+// Sections are written after a single empty line, unless the file already ends
+// with one (or is still empty).
+static BOOL EnsureBlankLine(TextBuf* tb) {
+    if (!tb->data || tb->len == 0) return TRUE;
+    if (tb->len >= 4 && tb->data[tb->len - 1] == L'\n' && tb->data[tb->len - 2] == L'\r' &&
+        tb->data[tb->len - 3] == L'\n') {
+        return TRUE;
+    }
+    return TextBufAppend(tb, L"\r\n");
+}
+
+// The defaults every program inherits. It is written even when it holds the
+// built-in values, so the file says where "nothing written" comes from.
+static BOOL AppendGeneralSection(TextBuf* tb) {
+    if (!EnsureBlankLine(tb)) return FALSE;
+    if (!TextBufAppend(tb, L"[General]\r\n")) return FALSE;
+    if (!TextBufAppendKey(tb, L"DefaultMode", ModeName(g_defaultMode))) return FALSE;
+    return TextBufAppendKey(tb, L"DefaultWindow", WindowName(g_defaultWindow));
+}
+
+// Keys are written in the order the edit dialog shows them. Empty optional fields
+// are left out, and so are Mode and Window when they are the default.
+static BOOL AppendProgramSection(TextBuf* tb, const ProgramConfig* prog) {
+    WCHAR header[MAX_NAME_LEN + 8];
+    if (!EnsureBlankLine(tb)) return FALSE;
+
+    swprintf(header, MAX_NAME_LEN + 8, L"[%s]\r\n", prog->name);
+    if (!TextBufAppend(tb, header)) return FALSE;
+    if (!TextBufAppend(tb, prog->comments)) return FALSE;
+    if (!TextBufAppendKey(tb, L"Path", prog->path)) return FALSE;
+    if (wcslen(prog->param) > 0 && !TextBufAppendKey(tb, L"Param", prog->param)) return FALSE;
+    if (wcslen(prog->start) > 0 && !TextBufAppendKey(tb, L"Start", prog->start)) return FALSE;
+    if (wcslen(prog->icon) > 0 && !TextBufAppendKey(tb, L"Icon", prog->icon)) return FALSE;
+    if (prog->mode != MODE_INHERIT && !TextBufAppendKey(tb, L"Mode", ModeName(prog->mode))) return FALSE;
+    if (prog->window != WINDOW_INHERIT && !TextBufAppendKey(tb, L"Window", WindowName(prog->window))) return FALSE;
+    if (wcslen(prog->type) > 0 && !TextBufAppendKey(tb, L"Type", prog->type)) return FALSE;
+    return TextBufAppend(tb, prog->extra);
+}
+
+// Save programs to the config file.
 // The whole file image is built in memory and written with a single file write.
 // The previous implementation issued one WritePrivateProfileStringW call per key,
 // and each of those calls rewrites the complete file, which froze the UI for
 // several seconds on every up/down click.
 void SavePrograms() {
+    // 1. Parse the file (which tokenizes its buffer) to learn which sections are managed
+    IniFile ini = {0};
+    WCHAR* parsedText = ReadTextFileW(g_iniPath);
+    if (parsedText) IniParseText(&ini, parsedText);
+
+    // 2. Copy everything the program does not manage
     TextBuf tb = {0};
-
-    // 1. Keep everything that is not managed here (other sections, comments)
-    WCHAR* oldText = ReadTextFileW(g_iniPath);
-    if (oldText) {
-        WCHAR section[64] = {0};
-        BOOL skip = FALSE;
-        const WCHAR* p = oldText;
-
-        while (*p) {
-            const WCHAR* lineEnd = p;
-            while (*lineEnd && *lineEnd != L'\r' && *lineEnd != L'\n') lineEnd++;
-            int lineLen = (int)(lineEnd - p);
-
-            const WCHAR* next = lineEnd;
-            while (*next == L'\r' || *next == L'\n') next++;
-
-            const WCHAR* s = p;
-            while (*s == L' ' || *s == L'\t') s++;
-            if (*s == L'[') {
-                const WCHAR* e = wcschr(s, L']');
-                if (e && (e - s - 1) < (int)(sizeof(section) / sizeof(section[0])) - 1) {
-                    wcsncpy_s(section, 64, s + 1, (size_t)(e - s - 1));
-                    skip = IsManagedSection(section);
-                }
-            }
-
-            if (!skip && !TextBufAppendN(&tb, p, lineLen)) break;
-            if (!skip && !TextBufAppend(&tb, L"\r\n")) break;
-
-            p = next;
-        }
-
-        HeapFree(GetProcessHeap(), 0, oldText);
-
-        // Separate preserved content from the generated blocks
-        if (tb.len > 0) {
-            if (!TextBufAppend(&tb, L"\r\n")) { TextBufFree(&tb); return; }
-        }
+    WCHAR* rawText = ReadTextFileW(g_iniPath);
+    if (rawText && ini.entries) {
+        CopyUnmanagedLines(&tb, rawText, &ini);
+        HeapFree(GetProcessHeap(), 0, rawText);
+    } else if (rawText) {
+        HeapFree(GetProcessHeap(), 0, rawText);
     }
 
-    // 2. [General] Count
-    WCHAR buffer[64];
-    swprintf(buffer, 64, L"%d", g_programCount);
-    if (!TextBufAppend(&tb, L"[General]\r\n") ||
-        !TextBufAppendKey(&tb, L"Count", buffer)) {
+    // 3. The defaults, then one section per program in list order
+    if (!AppendGeneralSection(&tb)) {
         TextBufFree(&tb);
+        IniFree(&ini);
         return;
     }
 
-    // 3. [ProgramN] blocks
     for (int i = 0; i < g_programCount; i++) {
-        WCHAR section[32];
-        swprintf(section, 32, L"\r\n[Program%d]\r\n", i);
-
-        if (!TextBufAppend(&tb, section) ||
-            !TextBufAppendKey(&tb, L"Name", g_programs[i].name) ||
-            !TextBufAppendKey(&tb, L"Path", g_programs[i].path) ||
-            !TextBufAppendKey(&tb, L"Param", g_programs[i].param) ||
-            !TextBufAppendKey(&tb, L"Start", g_programs[i].start)) {
+        if (!AppendProgramSection(&tb, &g_programs[i])) {
             TextBufFree(&tb);
-            return;
-        }
-
-        swprintf(buffer, 64, L"%d", g_programs[i].main);
-        if (!TextBufAppendKey(&tb, L"Main", buffer)) { TextBufFree(&tb); return; }
-
-        swprintf(buffer, 64, L"%d", g_programs[i].mode);
-        if (!TextBufAppendKey(&tb, L"Mode", buffer)) { TextBufFree(&tb); return; }
-
-        swprintf(buffer, 64, L"%d", g_programs[i].window);
-        if (!TextBufAppendKey(&tb, L"Window", buffer)) { TextBufFree(&tb); return; }
-
-        if (!TextBufAppendKey(&tb, L"Icon", g_programs[i].icon) ||
-            !TextBufAppendKey(&tb, L"Type", g_programs[i].type)) {
-            TextBufFree(&tb);
+            IniFree(&ini);
             return;
         }
     }
 
     // 4. One single write
-    if (tb.data) {
-        WriteTextFileW(g_iniPath, tb.data, tb.len);
-    }
+    WriteTextFileW(g_iniPath, tb.data, tb.len);
     TextBufFree(&tb);
+    IniFree(&ini);
 }
 
 // Load icon from path (format: "path,index")
@@ -748,10 +1041,10 @@ void InitListView(HWND hwnd) {
     col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT;
     col.fmt = LVCFMT_LEFT;
     
-    const WCHAR* headers[] = {L"图标", L"名称", L"路径", L"参数", L"启动路径", 
-                              L"打开方式", L"窗口模式", L"主窗口", L"关联扩展名"};
-    
-    for (int i = 0; i < 9; i++) {
+    const WCHAR* headers[] = {L"图标", L"名称", L"路径", L"参数", L"启动路径",
+                              L"打开方式", L"窗口模式", L"关联扩展名"};
+
+    for (int i = 0; i < 8; i++) {
         col.pszText = (LPWSTR)headers[i];
         col.cx = g_settings.columnWidths[i];
         SendMessageW(g_hListView, LVM_INSERTCOLUMNW, i, (LPARAM)&col);
@@ -778,17 +1071,14 @@ void UpdateListViewRow(int row) {
     ListView_SetItemText(g_hListView, row, 3, prog->param);
     ListView_SetItemText(g_hListView, row, 4, prog->start);
 
-    WCHAR* modeText = prog->mode == 0 ? L"独立" : L"合并";
-    ListView_SetItemText(g_hListView, row, 5, modeText);
+    int mode = ProgramMode(prog);
+    ListView_SetItemText(g_hListView, row, 5, mode == MODE_MERGE ? L"合并" : L"独立");
 
-    WCHAR* windowText = prog->window == 0 ? L"常规" : (prog->window == 1 ? L"最大化" : L"最小化");
-    ListView_SetItemText(g_hListView, row, 6, windowText);
+    int window = ProgramWindow(prog);
+    ListView_SetItemText(g_hListView, row, 6, window == WINDOW_NORMAL ? L"常规"
+                        : (window == WINDOW_MAX ? L"最大化" : L"最小化"));
 
-    WCHAR mainText[16];
-    swprintf(mainText, 16, L"%d", prog->main);
-    ListView_SetItemText(g_hListView, row, 7, mainText);
-
-    ListView_SetItemText(g_hListView, row, 8, prog->type);
+    ListView_SetItemText(g_hListView, row, 7, prog->type);
 }
 
 // Add program to ListView
@@ -1054,18 +1344,28 @@ LRESULT CALLBACK EditDialogSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     
                     prog.mode = (int)SendDlgItemMessageW(hwnd, IDD_COMBO_MODE, CB_GETCURSEL, 0, 0);
                     prog.window = (int)SendDlgItemMessageW(hwnd, IDD_COMBO_WINDOW, CB_GETCURSEL, 0, 0);
-                    prog.main = 0;
-                    
-                    if (wcslen(prog.name) == 0 || wcslen(prog.path) == 0) {
-                        MessageBoxW(hwnd, L"名称和路径不能为空！", L"错误", MB_OK | MB_ICONERROR);
+
+                    if (wcslen(prog.path) == 0) {
+                        MessageBoxW(hwnd, L"路径不能为空！", L"错误", MB_OK | MB_ICONERROR);
                         return 0;
                     }
-                    
+
+                    // The name doubles as the section header of the program, so keep
+                    // it usable as one, and unique among the other programs
+                    SanitizeProgramName(prog.name);
+                    if (prog.name[0] == L'\0') ProgramNameFromPath(prog.path, prog.name, MAX_NAME_LEN);
+
                     if (g_editIndex >= 0 && g_editIndex < g_programCount) {
+                        // The section keeps its comments and its foreign keys
+                        wcscpy_s(prog.extra, MAX_EXTRA_LEN, g_programs[g_editIndex].extra);
+                        wcscpy_s(prog.comments, MAX_COMMENT_LEN, g_programs[g_editIndex].comments);
                         g_programs[g_editIndex] = prog;
+                        MakeProgramNameUnique(g_programs[g_editIndex].name, g_editIndex);
                     } else {
                         if (g_programCount < MAX_PROGRAMS) {
-                            g_programs[g_programCount++] = prog;
+                            g_programs[g_programCount] = prog;
+                            MakeProgramNameUnique(g_programs[g_programCount].name, -1);
+                            g_programCount++;
                         } else {
                             MessageBoxW(hwnd, L"已达到最大程序数量限制！", L"错误", MB_OK | MB_ICONERROR);
                             return 0;
@@ -1268,8 +1568,8 @@ void ShowEditDialog(HWND parent, int index) {
         SetDlgItemTextW(hwnd, IDD_EDIT_PARAM, prog->param);
         SetDlgItemTextW(hwnd, IDD_EDIT_START, prog->start);
         SetDlgItemTextW(hwnd, IDD_EDIT_TYPE, prog->type);
-        SendDlgItemMessageW(hwnd, IDD_COMBO_MODE, CB_SETCURSEL, prog->mode, 0);
-        SendDlgItemMessageW(hwnd, IDD_COMBO_WINDOW, CB_SETCURSEL, prog->window, 0);
+        SendDlgItemMessageW(hwnd, IDD_COMBO_MODE, CB_SETCURSEL, ProgramMode(prog), 0);
+        SendDlgItemMessageW(hwnd, IDD_COMBO_WINDOW, CB_SETCURSEL, ProgramWindow(prog), 0);
         
         // Parse icon string "path,index"
         WCHAR* comma = wcsrchr(prog->icon, L',');
@@ -1821,10 +2121,11 @@ void ExecuteProgram(ProgramConfig* prog, WCHAR** files, int fileCount) {
     
     // Determine window state
     int nShowCmd = SW_SHOWNORMAL;
-    if (prog->window == 1) nShowCmd = SW_SHOWMAXIMIZED;
-    else if (prog->window == 2) nShowCmd = SW_SHOWMINIMIZED;
+    int windowMode = ProgramWindow(prog);
+    if (windowMode == WINDOW_MAX) nShowCmd = SW_SHOWMAXIMIZED;
+    else if (windowMode == WINDOW_MIN) nShowCmd = SW_SHOWMINIMIZED;
     
-    if (prog->mode == 0) {
+    if (ProgramMode(prog) == MODE_SEPARATE) {
         // Independent mode - launch for each file
         for (int i = 0; i < fileCount; i++) {
             WCHAR cmdLine[MAX_PATH_LEN * 2];
