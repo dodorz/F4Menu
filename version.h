@@ -3,7 +3,7 @@
 #define F4MENU_VERSION_H
 
 #ifndef F4MENU_VERSION_A
-#define F4MENU_VERSION_A "0.1.1"
+#define F4MENU_VERSION_A "0.1.2"
 #endif
 
 #ifndef F4MENU_VER_MAJOR
@@ -15,7 +15,7 @@
 #endif
 
 #ifndef F4MENU_VER_PATCH
-#define F4MENU_VER_PATCH 1
+#define F4MENU_VER_PATCH 2
 #endif
 
 #ifndef F4MENU_VER_BUILD

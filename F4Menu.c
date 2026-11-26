@@ -96,13 +96,16 @@
 // interpret, so hand-written notes and keys survive a rewrite.
 typedef struct {
     WCHAR name[MAX_NAME_LEN];
-    WCHAR path[MAX_PATH_LEN];
+    WCHAR path[MAX_PATH_LEN];          // raw value as written in the INI
+    WCHAR resolvedPath[MAX_PATH_LEN];  // path after %ENV% and $(...) expansion
     WCHAR param[MAX_PARAM_LEN];
     WCHAR start[MAX_PATH_LEN];
-    WCHAR icon[MAX_PATH_LEN];
+    WCHAR icon[MAX_PATH_LEN];          // raw value as written in the INI
+    WCHAR resolvedIcon[MAX_PATH_LEN];  // icon string after %ENV% and $(...) expansion
     WCHAR type[MAX_TYPE_LEN];
     int mode;                 // MODE_SEPARATE, MODE_MERGE or MODE_INHERIT
     int window;               // WINDOW_NORMAL/MAX/MIN or WINDOW_INHERIT
+    BOOL resolved;            // resolvedPath / resolvedIcon hold a current value
     WCHAR extra[MAX_EXTRA_LEN];
     WCHAR comments[MAX_COMMENT_LEN];
 } ProgramConfig;
@@ -177,6 +180,10 @@ BOOL MatchExtension(const WCHAR* fileExt, const WCHAR* typeList);
 void ExecuteProgram(ProgramConfig* prog, WCHAR** files, int fileCount);
 HICON LoadIconFromPath(const WCHAR* iconPath);
 void ExpandEnvStrings(const WCHAR* src, WCHAR* dst, DWORD dstSize);
+void ResolvePathString(const WCHAR* src, WCHAR* dst, DWORD dstSize);
+void ResolveProgramPaths(ProgramConfig* prog);
+const WCHAR* ProgramPath(ProgramConfig* prog);
+const WCHAR* ProgramIcon(ProgramConfig* prog);
 BOOL GetExeProductName(const WCHAR* exePath, WCHAR* name, DWORD nameSize);
 void AddProgramFromFilePath(HWND hwnd, const WCHAR* exePath);
 
@@ -289,6 +296,290 @@ static void GetIconCachePath(WCHAR* path, DWORD size) {
 // Expand environment variables
 void ExpandEnvStrings(const WCHAR* src, WCHAR* dst, DWORD dstSize) {
     ExpandEnvironmentStringsW(src, dst, dstSize);
+}
+
+// ---------------------------------------------------------------------------
+// $(...) command substitution
+//
+// A path may contain "$(...)": the text between the parentheses is run through
+// the command processor, and the string it writes to standard output replaces
+// the whole expression.  Only the resolved value is cached (in
+// ProgramConfig::resolvedPath / resolvedIcon); the INI file, the main list and
+// the edit dialog keep the unresolved text the user wrote.
+// ---------------------------------------------------------------------------
+#define RESOLVE_TIMEOUT_MS       3000    // a hanging command must not freeze the UI
+#define RESOLVE_MAX_OUTPUT       8192    // bytes captured from standard output
+#define RESOLVE_MAX_SUBSTITUTES  8       // expressions handled in one value
+
+static void AppendLimited(WCHAR* dst, DWORD dstSize, DWORD* pos, const WCHAR* src) {
+    while (*src && *pos + 1 < dstSize) dst[(*pos)++] = *src++;
+    dst[*pos] = L'\0';
+}
+
+// Reduce captured output to the value that is used as a path: the first
+// non-empty line (a command may print extra lines after it), trimmed, without
+// the quotes it may have echoed around the value.
+static void NormalizeCommandOutput(WCHAR* text) {
+    WCHAR* p = text;
+    WCHAR* selected;
+    size_t len;
+
+    // Skip the blank lines in front of the answer and trim its indentation
+    while (*p == L' ' || *p == L'\t' || *p == L'\r' || *p == L'\n') p++;
+    selected = p;
+    while (*p && *p != L'\r' && *p != L'\n') p++;
+
+    // Everything from the end of the line on goes away
+    while (p > selected && (p[-1] == L' ' || p[-1] == L'\t')) p--;
+    *p = L'\0';
+
+    // A command that echoes a quoted path means the path without the quotes
+    len = wcslen(selected);
+    if (len >= 2 && ((selected[0] == L'"' && selected[len - 1] == L'"') ||
+                     (selected[0] == L'\'' && selected[len - 1] == L'\''))) {
+        selected[len - 1] = L'\0';
+        selected++;
+    }
+
+    if (selected != text) {
+        len = wcslen(selected);
+        CopyMemory(text, selected, len * sizeof(WCHAR));
+        text[len] = L'\0';
+    }
+}
+
+// Decode captured bytes as UTF-8 (what most tools emit), falling back to the
+// ANSI code page (what cmd.exe itself writes).
+static void DecodeCommandOutput(const BYTE* bytes, DWORD len, WCHAR* out, DWORD outChars) {
+    UINT codePage = CP_UTF8;
+    int wideLen;
+
+    out[0] = L'\0';
+    if (!bytes || len == 0) return;
+
+    if (len >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) {
+        bytes += 3;
+        len -= 3;
+    }
+
+    wideLen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, (const char*)bytes, (int)len, NULL, 0);
+    if (wideLen <= 0) {
+        codePage = CP_ACP;
+        wideLen = MultiByteToWideChar(CP_ACP, 0, (const char*)bytes, (int)len, NULL, 0);
+    }
+    if (wideLen <= 0) return;
+
+    if ((DWORD)wideLen >= outChars) wideLen = (int)outChars - 1;
+    MultiByteToWideChar(codePage, 0, (const char*)bytes, (int)len, out, wideLen);
+    out[wideLen] = L'\0';
+}
+
+// Run "command" through cmd.exe with a hidden window and capture its stdout.
+static BOOL RunCommandCaptureOutput(const WCHAR* command, WCHAR* out, DWORD outChars) {
+    WCHAR comspec[MAX_PATH] = L"cmd.exe";
+    WCHAR cmdLine[MAX_PATH_LEN * 2];
+    DWORD comspecLen;
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    HANDLE hReadPipe = NULL;
+    HANDLE hWritePipe = NULL;
+    HANDLE hNul = INVALID_HANDLE_VALUE;
+    HANDLE hErr;
+    STARTUPINFOW si = {0};
+    PROCESS_INFORMATION pi = {0};
+    BYTE captured[RESOLVE_MAX_OUTPUT];
+    DWORD capturedLen = 0;
+    DWORD startTick;
+    BOOL started;
+
+    out[0] = L'\0';
+    if (!command || !*command) return TRUE;
+
+    comspecLen = GetEnvironmentVariableW(L"ComSpec", comspec, MAX_PATH);
+    if (comspecLen == 0 || comspecLen >= MAX_PATH) wcscpy_s(comspec, MAX_PATH, L"cmd.exe");
+
+    if (wcslen(comspec) + wcslen(command) + 32 >= MAX_PATH_LEN * 2) return FALSE;
+    swprintf(cmdLine, MAX_PATH_LEN * 2, L"\"%s\" /d /s /c \"%s\"", comspec, command);
+
+    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) return FALSE;
+    SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
+
+    hNul = CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE,
+                       FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
+    hErr = (hNul != INVALID_HANDLE_VALUE) ? hNul : hWritePipe;
+
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput = hWritePipe;
+    si.hStdError = hErr;    // stderr must not end up in the substituted value
+    si.hStdInput = (hNul != INVALID_HANDLE_VALUE) ? hNul : NULL;
+
+    started = CreateProcessW(NULL, cmdLine, NULL, NULL, TRUE, CREATE_NO_WINDOW,
+                             NULL, NULL, &si, &pi);
+
+    CloseHandle(hWritePipe);
+    if (hNul != INVALID_HANDLE_VALUE) CloseHandle(hNul);
+    if (!started) {
+        CloseHandle(hReadPipe);
+        return FALSE;
+    }
+    CloseHandle(pi.hThread);
+
+    // Peek-and-read instead of a blocking ReadFile so a command that never
+    // terminates still returns control after RESOLVE_TIMEOUT_MS.
+    startTick = GetTickCount();
+    for (;;) {
+        DWORD avail = 0;
+
+        if (!PeekNamedPipe(hReadPipe, NULL, 0, NULL, &avail, NULL)) break;
+
+        if (avail > 0) {
+            DWORD got = 0;
+            if (capturedLen < RESOLVE_MAX_OUTPUT) {
+                DWORD want = avail;
+                if (want > RESOLVE_MAX_OUTPUT - capturedLen) want = RESOLVE_MAX_OUTPUT - capturedLen;
+                if (!ReadFile(hReadPipe, captured + capturedLen, want, &got, NULL) || got == 0) break;
+                capturedLen += got;
+            } else {
+                // Drain the rest so the child is not blocked on a full pipe;
+                // the value is already as long as one substitution can carry.
+                BYTE discard[1024];
+                DWORD want = avail > sizeof(discard) ? (DWORD)sizeof(discard) : avail;
+                if (!ReadFile(hReadPipe, discard, want, &got, NULL) || got == 0) break;
+            }
+            continue;
+        }
+
+        if (WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) {
+            // Take whatever arrived between the last peek and the exit
+            if (!PeekNamedPipe(hReadPipe, NULL, 0, NULL, &avail, NULL) || avail == 0) break;
+            continue;
+        }
+
+        if (GetTickCount() - startTick > RESOLVE_TIMEOUT_MS) {
+            TerminateProcess(pi.hProcess, 1);
+            break;
+        }
+        Sleep(1);
+    }
+
+    WaitForSingleObject(pi.hProcess, 200);
+    CloseHandle(pi.hProcess);
+    CloseHandle(hReadPipe);
+
+    if (capturedLen > 0) DecodeCommandOutput(captured, capturedLen, out, outChars);
+    NormalizeCommandOutput(out);
+    return TRUE;
+}
+
+// Expand %ENV% variables and $(...) expressions.  An expression without a
+// closing parenthesis is left as literal text, and a value without "$(" is
+// merely environment-expanded, which is what every field used to do.
+void ResolvePathString(const WCHAR* src, WCHAR* dst, DWORD dstSize) {
+    DWORD pos = 0;
+    int substitutions = 0;
+    const WCHAR* p;
+
+    if (!dst || dstSize == 0) return;
+    dst[0] = L'\0';
+    if (!src) return;
+
+    p = src;
+    while (*p) {
+        if (*p == L'$' && p[1] == L'(' && substitutions < RESOLVE_MAX_SUBSTITUTES) {
+            const WCHAR* q = p + 2;
+            int depth = 1;
+
+            while (*q) {
+                if (*q == L'(') {
+                    depth++;
+                } else if (*q == L')') {
+                    depth--;
+                    if (depth == 0) break;
+                }
+                q++;
+            }
+
+            DWORD cmdLen = (DWORD)(q - (p + 2));
+            if (depth == 0 && cmdLen < MAX_PATH_LEN) {
+                WCHAR command[MAX_PATH_LEN];
+                WCHAR output[MAX_PATH_LEN * 2] = {0};
+
+                CopyMemory(command, p + 2, cmdLen * sizeof(WCHAR));
+                command[cmdLen] = L'\0';
+                RunCommandCaptureOutput(command, output, MAX_PATH_LEN * 2);
+                AppendLimited(dst, dstSize, &pos, output);
+                substitutions++;
+                p = q + 1;
+                continue;
+            }
+        }
+
+        WCHAR ch[2] = { *p, L'\0' };
+        AppendLimited(dst, dstSize, &pos, ch);
+        p++;
+    }
+
+    // %ENV% still applies to the result (and to plain values without any "$(")
+    WCHAR expanded[MAX_PATH_LEN * 4];
+    DWORD expandedLen = ExpandEnvironmentStringsW(dst, expanded, MAX_PATH_LEN * 4);
+    if (expandedLen > 0 && expandedLen <= MAX_PATH_LEN * 4) {
+        pos = 0;
+        dst[0] = L'\0';
+        AppendLimited(dst, dstSize, &pos, expanded);
+    }
+}
+
+// TRUE when every "$(" in the value has a matching ")".  The edit dialog uses
+// this to hold back the icon preview while the expression is still being typed,
+// which keeps it from starting a command on every keystroke.
+static BOOL SubstitutionsBalanced(const WCHAR* s) {
+    while (s && *s) {
+        if (*s == L'$' && s[1] == L'(') {
+            int depth = 1;
+            const WCHAR* q = s + 2;
+
+            while (*q && depth > 0) {
+                if (*q == L'(') depth++;
+                else if (*q == L')') depth--;
+                q++;
+            }
+            if (depth > 0) return FALSE;
+            s = q;
+            continue;
+        }
+        s++;
+    }
+    return TRUE;
+}
+
+// Resolve one field only when it can actually change: a value without "$"
+// (and without "%") is copied verbatim, so ordinary paths cost nothing.
+static void ResolveFieldIfNeeded(const WCHAR* src, WCHAR* dst, DWORD dstSize) {
+    if (wcschr(src, L'$') || wcschr(src, L'%')) {
+        ResolvePathString(src, dst, dstSize);
+    } else {
+        wcscpy_s(dst, dstSize, src);
+    }
+}
+
+// Re-resolve both path fields of a program and cache the result in its state.
+void ResolveProgramPaths(ProgramConfig* prog) {
+    ResolveFieldIfNeeded(prog->path, prog->resolvedPath, MAX_PATH_LEN);
+    ResolveFieldIfNeeded(prog->icon, prog->resolvedIcon, MAX_PATH_LEN);
+    prog->resolved = TRUE;
+}
+
+// Resolved value for launching / icon extraction.  LoadPrograms() and the edit
+// dialog's OK button both refresh the cache, so these normally just read it.
+const WCHAR* ProgramPath(ProgramConfig* prog) {
+    if (!prog->resolved) ResolveProgramPaths(prog);
+    return prog->resolvedPath;
+}
+
+const WCHAR* ProgramIcon(ProgramConfig* prog) {
+    if (!prog->resolved) ResolveProgramPaths(prog);
+    return prog->resolvedIcon;
 }
 
 // INI file parser - single read, in-memory parse (replaces per-field GetPrivateProfile API calls)
@@ -900,13 +1191,23 @@ static void LoadProgramFromSection(ProgramConfig* prog, IniFile* ini, const WCHA
     const WCHAR* val = (name && *name) ? name : section;
     CopyField(prog->name, MAX_NAME_LEN, val);
     SanitizeProgramName(prog->name);
-    if (prog->name[0] == L'\0') ProgramNameFromPath(path, prog->name, MAX_NAME_LEN);
 
     CopyField(prog->path, MAX_PATH_LEN, path);
     if (param) CopyField(prog->param, MAX_PARAM_LEN, param);
     if (start) CopyField(prog->start, MAX_PATH_LEN, start);
     if (icon)  CopyField(prog->icon, MAX_PATH_LEN, icon);
     if (type)  CopyField(prog->type, MAX_TYPE_LEN, type);
+
+    // Parsing is where $(...) is resolved: the command output is cached in
+    // resolvedPath / resolvedIcon, while prog->path / prog->icon keep the raw
+    // text for the file, the main list and the edit dialog.  A value without
+    // "$(" or "%" is copied verbatim, so plain paths cost nothing.
+    ResolveProgramPaths(prog);
+
+    // An empty section name gets a fallback name from the resolved path
+    if (prog->name[0] == L'\0') {
+        ProgramNameFromPath(prog->resolvedPath, prog->name, MAX_NAME_LEN);
+    }
 
     // A value equal to the default is not worth a line in the file
     prog->mode = (mode && *mode) ? ParseModeValue(mode) : MODE_INHERIT;
@@ -1633,6 +1934,8 @@ HICON LoadIconFromPath(const WCHAR* iconPath) {
     BOOL srcKnown;
     HICON hIcon = NULL;
     
+    // Callers pass an already resolved value (ProgramIcon); a plain path still
+    // gets its %ENV% variables expanded here
     ExpandEnvStrings(iconPath, expandedPath, MAX_PATH_LEN);
     
     // Parse icon path and index
@@ -1757,7 +2060,7 @@ static void FillListViewIcons(void) {
     for (int i = 0; i < g_programCount; i++) {
         if (g_rowImage[i] >= 0) continue;
 
-        HICON hIcon = LoadIconFromPath(g_programs[i].icon);
+        HICON hIcon = LoadIconFromPath(ProgramIcon(&g_programs[i]));
         int imageIndex = ImageList_AddIcon(g_hImageList, hIcon);
         if (hIcon) DestroyIcon(hIcon);
 
@@ -1929,13 +2232,21 @@ static HBITMAP IconToBitmap(HICON hIcon, int size) {
 // File the icon preview list currently shows ("" when it is empty)
 static WCHAR g_iconListSource[MAX_PATH_LEN] = {0};
 
+// Set while the edit dialog fills its fields: the EN_CHANGE handler would
+// otherwise resolve (and preview) the raw text that is being written, which for
+// a $(...) value would run the command a second time straight away.
+static BOOL g_iconPreviewSuppressed = FALSE;
+
 // Extract icons from file and show in icon list view
 static void ExtractAndShowIcons(HWND hDlg, const WCHAR* filePath) {
     HWND hIconList = GetDlgItem(hDlg, IDD_ICON_LIST);
     if (!hIconList) return;
     
+    // A plain path is used as-is; only "$(" or "%" needs work.  Callers pass
+    // either text typed into the icon field (raw, still holding the $(...))
+    // or a value from the program state (already resolved).
     WCHAR expandedPath[MAX_PATH_LEN];
-    ExpandEnvStrings(filePath, expandedPath, MAX_PATH_LEN);
+    ResolveFieldIfNeeded(filePath, expandedPath, MAX_PATH_LEN);
     
     // Already showing this file: writing the icon field fires EN_CHANGE and
     // the callers then ask for the icons explicitly as well, so without this
@@ -2034,7 +2345,15 @@ LRESULT CALLBACK EditDialogSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 case IDD_EDIT_ICON_FILE: {
                     if (HIWORD(wParam) == EN_CHANGE) {
                         WCHAR iconFile[MAX_PATH_LEN];
+                        if (g_iconPreviewSuppressed) return 0;
                         GetDlgItemTextW(hwnd, IDD_EDIT_ICON_FILE, iconFile, MAX_PATH_LEN);
+
+                        // While a $(...) expression is still half-typed there is
+                        // nothing to resolve yet: leave the preview and the
+                        // chosen icon index alone instead of running a command
+                        // per keystroke
+                        if (wcslen(iconFile) > 0 && !SubstitutionsBalanced(iconFile)) return 0;
+
                         if (wcslen(iconFile) > 0) {
                             ExtractAndShowIcons(hwnd, iconFile);
                         } else {
@@ -2079,7 +2398,12 @@ LRESULT CALLBACK EditDialogSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     // The name doubles as the section header of the program, so keep
                     // it usable as one, and unique among the other programs
                     SanitizeProgramName(prog.name);
-                    if (prog.name[0] == L'\0') ProgramNameFromPath(prog.path, prog.name, MAX_NAME_LEN);
+
+                    // Re-resolve the edited fields on OK; the result is cached in
+                    // the program state while the dialog and the INI keep the raw
+                    // text with the $(...) expression
+                    ResolveProgramPaths(&prog);
+                    if (prog.name[0] == L'\0') ProgramNameFromPath(ProgramPath(&prog), prog.name, MAX_NAME_LEN);
 
                     if (g_editIndex >= 0 && g_editIndex < g_programCount) {
                         // The section keeps its comments and its foreign keys
@@ -2298,17 +2622,32 @@ void ShowEditDialog(HWND parent, int index) {
         SendDlgItemMessageW(hwnd, IDD_COMBO_MODE, CB_SETCURSEL, ProgramMode(prog), 0);
         SendDlgItemMessageW(hwnd, IDD_COMBO_WINDOW, CB_SETCURSEL, ProgramWindow(prog), 0);
         
-        // Parse icon string "path,index"
-        WCHAR* comma = wcsrchr(prog->icon, L',');
-        if (comma) {
-            *comma = L'\0';
-            g_selectedIconIndex = _wtoi(comma + 1);
-            SetDlgItemTextW(hwnd, IDD_EDIT_ICON_FILE, prog->icon);
+        // The icon field shows the raw "path,index" text; the preview uses the
+        // already resolved copy from the program state, so opening the dialog
+        // does not run the $(...) command a second time
+        WCHAR rawIcon[MAX_PATH_LEN];
+        WCHAR resolvedIcon[MAX_PATH_LEN];
+        wcscpy_s(rawIcon, MAX_PATH_LEN, prog->icon);
+        wcscpy_s(resolvedIcon, MAX_PATH_LEN, ProgramIcon(prog));
+
+        WCHAR* rawComma = wcsrchr(rawIcon, L',');
+        if (rawComma) {
+            WCHAR* resolvedComma = wcsrchr(resolvedIcon, L',');
+
+            *rawComma = L'\0';
+            g_selectedIconIndex = _wtoi(rawComma + 1);
+            if (resolvedComma) *resolvedComma = L'\0';
+
+            // Suppressed so the EN_CHANGE handler does not resolve the raw
+            // value again while it is being written into the field
+            g_iconPreviewSuppressed = TRUE;
+            SetDlgItemTextW(hwnd, IDD_EDIT_ICON_FILE, rawIcon);
+            g_iconPreviewSuppressed = FALSE;
+
             WCHAR idxStr[16];
             swprintf(idxStr, 16, L"%d", g_selectedIconIndex);
             SetDlgItemTextW(hwnd, IDD_ICON_INDEX, idxStr);
-            ExtractAndShowIcons(hwnd, prog->icon);
-            *comma = L',';
+            ExtractAndShowIcons(hwnd, resolvedIcon);
             
             // Select the correct icon
             if (g_selectedIconIndex >= 0) {
@@ -2911,7 +3250,7 @@ void ExecuteProgram(ProgramConfig* prog, WCHAR** files, int fileCount) {
     WCHAR expandedStart[MAX_PATH_LEN];
     WCHAR expandedParam[MAX_PARAM_LEN];
     
-    ExpandEnvStrings(prog->path, expandedPath, MAX_PATH_LEN);
+    wcscpy_s(expandedPath, MAX_PATH_LEN, ProgramPath(prog));
     ExpandEnvStrings(prog->start, expandedStart, MAX_PATH_LEN);
     ExpandEnvStrings(prog->param, expandedParam, MAX_PARAM_LEN);
     
@@ -3009,10 +3348,10 @@ static void FillProgramsSubmenu(void) {
         mii.fMask = MIIM_BITMAP | MIIM_STATE;
 
         WCHAR expandedPath[MAX_PATH_LEN];
-        ExpandEnvStrings(g_programs[i].path, expandedPath, MAX_PATH_LEN);
+        wcscpy_s(expandedPath, MAX_PATH_LEN, ProgramPath(&g_programs[i]));
         mii.fState = (GetFileAttributesW(expandedPath) == INVALID_FILE_ATTRIBUTES)
                         ? (MFS_DISABLED | MFS_GRAYED) : 0;
-        mii.hbmpItem = GetCachedIconBitmap(g_programs[i].icon, g_menuIconSize);
+        mii.hbmpItem = GetCachedIconBitmap(ProgramIcon(&g_programs[i]), g_menuIconSize);
 
         SetMenuItemInfoW(g_hSubMenuAll, i, TRUE, &mii);
     }
@@ -3101,10 +3440,10 @@ void LaunchMode(int argc, WCHAR** argv) {
         mii.wID = progIdx + 1;
         mii.dwTypeData = g_programs[progIdx].name;
         
-        mii.hbmpItem = GetCachedIconBitmap(g_programs[progIdx].icon, menuIconSize);
+        mii.hbmpItem = GetCachedIconBitmap(ProgramIcon(&g_programs[progIdx]), menuIconSize);
         
         WCHAR expandedPath[MAX_PATH_LEN];
-        ExpandEnvStrings(g_programs[progIdx].path, expandedPath, MAX_PATH_LEN);
+        wcscpy_s(expandedPath, MAX_PATH_LEN, ProgramPath(&g_programs[progIdx]));
         if (GetFileAttributesW(expandedPath) == INVALID_FILE_ATTRIBUTES) {
             mii.fMask |= MIIM_STATE;
             mii.fState = MFS_DISABLED | MFS_GRAYED;
