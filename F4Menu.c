@@ -311,6 +311,21 @@ void ExpandEnvStrings(const WCHAR* src, WCHAR* dst, DWORD dstSize) {
 #define RESOLVE_MAX_OUTPUT       8192    // bytes captured from standard output
 #define RESOLVE_MAX_SUBSTITUTES  8       // expressions handled in one value
 
+// Path and Icon normally hold the same command (the icon only adds ",0"), and
+// both are resolved during one pass - running the command a second time right
+// away is pure wait for anything that starts an interpreter.  The last answer
+// is reused instead.  It is dropped when a fresh pass begins (loading the INI,
+// pressing OK in the edit dialog) so a retry really does run the command again.
+static WCHAR g_lastSubCommand[MAX_PATH_LEN];
+static WCHAR g_lastSubOutput[MAX_PATH_LEN * 2];
+static BOOL g_lastSubValid = FALSE;
+
+static void ResetSubstitutionCache(void) {
+    g_lastSubCommand[0] = L'\0';
+    g_lastSubOutput[0] = L'\0';
+    g_lastSubValid = FALSE;
+}
+
 static void AppendLimited(WCHAR* dst, DWORD dstSize, DWORD* pos, const WCHAR* src) {
     while (*src && *pos + 1 < dstSize) dst[(*pos)++] = *src++;
     dst[*pos] = L'\0';
@@ -319,33 +334,60 @@ static void AppendLimited(WCHAR* dst, DWORD dstSize, DWORD* pos, const WCHAR* sr
 // Reduce captured output to the value that is used as a path: the first
 // non-empty line (a command may print extra lines after it), trimmed, without
 // the quotes it may have echoed around the value.
+//
+// Progress output needs care: tools write "\r<status>" without a newline so the
+// status overwrites itself on a console.  In a pipe those carriage returns stay
+// in the text, so a line can read "\r[scoopx] Installing...\rC:\path\app.exe".
+// Every line is therefore reduced to what a console would leave visible - the
+// text after its last '\r' - before it is considered as the answer.
 static void NormalizeCommandOutput(WCHAR* text) {
-    WCHAR* p = text;
-    WCHAR* selected;
-    size_t len;
+    const WCHAR* line = text;
 
-    // Skip the blank lines in front of the answer and trim its indentation
-    while (*p == L' ' || *p == L'\t' || *p == L'\r' || *p == L'\n') p++;
-    selected = p;
-    while (*p && *p != L'\r' && *p != L'\n') p++;
+    while (*line) {
+        const WCHAR* lineEnd = line;
+        const WCHAR* visible = line;
+        const WCHAR* start;
+        const WCHAR* end;
+        size_t len;
 
-    // Everything from the end of the line on goes away
-    while (p > selected && (p[-1] == L' ' || p[-1] == L'\t')) p--;
-    *p = L'\0';
+        while (*lineEnd && *lineEnd != L'\n') lineEnd++;
 
-    // A command that echoes a quoted path means the path without the quotes
-    len = wcslen(selected);
-    if (len >= 2 && ((selected[0] == L'"' && selected[len - 1] == L'"') ||
-                     (selected[0] == L'\'' && selected[len - 1] == L'\''))) {
-        selected[len - 1] = L'\0';
-        selected++;
+        // The '\r' of a CRLF terminator is not part of the line
+        while (lineEnd > line && lineEnd[-1] == L'\r') lineEnd--;
+
+        // Text written in front of a '\r' was overwritten on the console
+        for (start = line; start < lineEnd; start++) {
+            if (*start == L'\r') visible = start + 1;
+        }
+
+        // Trim the indentation and the blank space padding the status lines use
+        start = visible;
+        while (start < lineEnd && (*start == L' ' || *start == L'\t')) start++;
+        end = lineEnd;
+        while (end > start && (end[-1] == L' ' || end[-1] == L'\t')) end--;
+
+        if (end > start) {
+            len = (size_t)(end - start);
+
+            // A command that echoes a quoted path means the path without quotes
+            if (len >= 2 && ((start[0] == L'"' && start[len - 1] == L'"') ||
+                             (start[0] == L'\'' && start[len - 1] == L'\''))) {
+                start++;
+                len -= 2;
+            }
+
+            // MoveMemory: the answer is shifted down over the text in front of it
+            MoveMemory(text, start, len * sizeof(WCHAR));
+            text[len] = L'\0';
+            return;
+        }
+
+        if (!*lineEnd) break;
+        line = lineEnd + 1;
+        while (*line == L'\r' || *line == L'\n') line++;
     }
 
-    if (selected != text) {
-        len = wcslen(selected);
-        CopyMemory(text, selected, len * sizeof(WCHAR));
-        text[len] = L'\0';
-    }
+    text[0] = L'\0';
 }
 
 // Decode captured bytes as UTF-8 (what most tools emit), falling back to the
@@ -472,6 +514,20 @@ static BOOL RunCommandCaptureOutput(const WCHAR* command, WCHAR* out, DWORD outC
     return TRUE;
 }
 
+// Run one $(...) command, or hand back the answer it just produced for the
+// same command text.
+static void CaptureSubstitution(const WCHAR* command, WCHAR* out, DWORD outChars) {
+    if (g_lastSubValid && wcscmp(command, g_lastSubCommand) == 0) {
+        wcsncpy_s(out, outChars, g_lastSubOutput, _TRUNCATE);
+        return;
+    }
+
+    RunCommandCaptureOutput(command, out, outChars);
+    wcscpy_s(g_lastSubCommand, MAX_PATH_LEN, command);
+    wcsncpy_s(g_lastSubOutput, MAX_PATH_LEN * 2, out, _TRUNCATE);
+    g_lastSubValid = TRUE;
+}
+
 // Expand %ENV% variables and $(...) expressions.  An expression without a
 // closing parenthesis is left as literal text, and a value without "$(" is
 // merely environment-expanded, which is what every field used to do.
@@ -507,7 +563,7 @@ void ResolvePathString(const WCHAR* src, WCHAR* dst, DWORD dstSize) {
 
                 CopyMemory(command, p + 2, cmdLen * sizeof(WCHAR));
                 command[cmdLen] = L'\0';
-                RunCommandCaptureOutput(command, output, MAX_PATH_LEN * 2);
+                CaptureSubstitution(command, output, MAX_PATH_LEN * 2);
                 AppendLimited(dst, dstSize, &pos, output);
                 substitutions++;
                 p = q + 1;
@@ -1221,6 +1277,7 @@ static void LoadProgramFromSection(ProgramConfig* prog, IniFile* ini, const WCHA
 void LoadPrograms() {
     GetIniFilePath(g_iniPath, MAX_PATH);
     g_programCount = 0;
+    ResetSubstitutionCache();
 
     IniFile ini = {0};
     if (!IniLoad(&ini, g_iniPath)) return;
@@ -2401,7 +2458,9 @@ LRESULT CALLBACK EditDialogSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 
                     // Re-resolve the edited fields on OK; the result is cached in
                     // the program state while the dialog and the INI keep the raw
-                    // text with the $(...) expression
+                    // text with the $(...) expression.  The substitution cache is
+                    // dropped first, so pressing OK again runs the command again.
+                    ResetSubstitutionCache();
                     ResolveProgramPaths(&prog);
                     if (prog.name[0] == L'\0') ProgramNameFromPath(ProgramPath(&prog), prog.name, MAX_NAME_LEN);
 
