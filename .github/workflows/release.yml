@@ -5,6 +5,7 @@ on:
     tags:
       - '[0-9]+.[0-9]+.[0-9]+'
       - '[0-9]+.[0-9]+.[0-9]+-*'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -18,15 +19,18 @@ jobs:
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 
-      - name: Write version.h from tag
+      # A tag names the release version; without one (workflow_dispatch) the
+      # checked-in version.h is used, so a manual build keeps the current number.
+      - name: Resolve version
         shell: bash
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          MAJOR=$(echo "$TAG" | cut -d. -f1)
-          MINOR=$(echo "$TAG" | cut -d. -f2)
-          PATCH=$(echo "$TAG" | cut -d. -f3)
-          BUILD=$(echo "$TAG" | grep -oP '(?<=-)\d+$' || echo "0")
-          cat > version.h << EOF
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+            MAJOR=$(echo "$TAG" | cut -d. -f1)
+            MINOR=$(echo "$TAG" | cut -d. -f2)
+            PATCH=$(echo "$TAG" | cut -d. -f3)
+            BUILD=$(echo "$TAG" | grep -oP '(?<=-)\d+$' || echo "0")
+            cat > version.h << EOF
           #ifndef F4MENU_VERSION_H
           #define F4MENU_VERSION_H
           #define F4MENU_VERSION_A L"$TAG"
@@ -36,6 +40,12 @@ jobs:
           #define F4MENU_VER_BUILD $BUILD
           #endif
           EOF
+          else
+            TAG="dev-$(git rev-parse --short HEAD)"
+            echo "Not a tag build, using checked-in version.h:"
+            cat version.h
+          fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
 
       - name: Build and collect per-platform binaries
         shell: pwsh
@@ -53,12 +63,19 @@ jobs:
       - name: Package
         shell: bash
         run: |
-          TAG="${{ github.ref_name }}"
-          7z a "F4Menu-${TAG}-x64.zip"    ./dist/x64/*
-          7z a "F4Menu-${TAG}-Win32.zip"  ./dist/Win32/*
-          7z a "F4Menu-${TAG}-ARM64.zip"  ./dist/ARM64/*
+          for arch in x64 Win32 ARM64; do
+            7z a "F4Menu-${TAG}-${arch}.zip" "./dist/${arch}/"*
+          done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: F4Menu-${{ env.TAG }}
+          path: F4Menu-*.zip
+          if-no-files-found: error
 
       - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           name: v${{ github.ref_name }}
